@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.6.1-2026-11-05';
+const VERSION = 'v1.7.0-2026-11-05';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -36,6 +36,8 @@ function boot() {
 	// 拖动状态提到 boot 作用域：tick 里的越界兜底需要知道是否正在拖
 	let drag = null;
 	let lastClampCheck = 0;
+	// 面板拖动（标题栏）
+	let panelDrag = null;
 
 	// ---------- 设置 ----------
 	const DEFAULTS = {
@@ -49,6 +51,8 @@ function boot() {
 		pinNewMessageTop: true, // 生成结束后把视口停在最新消息开头（而非底部）
 		posX: null,             // 状态球位置（null = 默认右下）
 		posY: null,
+		panelX: null,           // 悬浮面板位置（null = 跟随状态球）
+		panelY: null,
 	};
 
 	function getSettings() {
@@ -481,7 +485,8 @@ function boot() {
 #stcm-panel{position:fixed;z-index:60001;display:none;flex-direction:column;width:430px;max-width:94vw;max-height:70vh;overflow:hidden;
  background:var(--SmartThemeBlurTintColor,rgba(24,26,32,.96));color:var(--SmartThemeBodyColor,#e8eaf0);border-radius:12px;border:1px solid var(--SmartThemeBorderColor,rgba(255,255,255,.12));
  box-shadow:0 8px 32px rgba(0,0,0,.3);font-size:13px;backdrop-filter:blur(16px) saturate(1.15);-webkit-backdrop-filter:blur(16px) saturate(1.15)}
-#stcm-panel h3{margin:0;padding:12px 14px 8px;font-size:14px;display:flex;justify-content:space-between;align-items:center;flex:0 0 auto}
+#stcm-panel h3{margin:0;padding:12px 14px 8px;font-size:14px;display:flex;justify-content:space-between;align-items:center;flex:0 0 auto;
+ cursor:move;user-select:none;-webkit-user-select:none;touch-action:none}
 #stcm-panel h3 .stcm-x{cursor:pointer;opacity:.6;padding:2px 6px;border-radius:6px}
 #stcm-panel h3 .stcm-x:hover{opacity:1;background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 10%,transparent)}
 #stcm-panel .stcm-sec{padding:8px 14px;border-top:1px solid color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 8%,transparent);flex:0 0 auto}
@@ -614,6 +619,39 @@ function boot() {
 			panel.style.display = 'none';
 		});
 
+		// ---------- 面板拖动（按住标题栏拖；✕ 按钮除外） ----------
+		const panelHead = panel.querySelector('h3');
+		panelHead.addEventListener('pointerdown', (e) => {
+			if (e.button !== 0 || e.target.closest('.stcm-x')) { return; }
+			const rect = panel.getBoundingClientRect();
+			panelDrag = { sx: e.clientX, sy: e.clientY, ox: rect.left, oy: rect.top };
+			try { panelHead.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+			e.preventDefault();
+		});
+		panelHead.addEventListener('pointermove', (e) => {
+			if (!panelDrag) { return; }
+			const rect = panel.getBoundingClientRect();
+			// 拖动中就钳制：面板贴边等，不会跑到屏幕外（与状态球同一套逻辑）
+			const p = clampToViewport(panelDrag.ox + (e.clientX - panelDrag.sx), panelDrag.oy + (e.clientY - panelDrag.sy), rect.width, rect.height);
+			panel.style.left = `${p.x}px`;
+			panel.style.top = `${p.y}px`;
+		});
+		const endPanelDrag = (e) => {
+			if (!panelDrag) { return; }
+			panelDrag = null;
+			try { panelHead.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+			const rect = panel.getBoundingClientRect();
+			// 松手按实际位置再钳一次，写回元素并保存
+			const p = clampToViewport(rect.left, rect.top, rect.width, rect.height);
+			panel.style.left = `${p.x}px`;
+			panel.style.top = `${p.y}px`;
+			settings.panelX = p.x;
+			settings.panelY = p.y;
+			saveSettingsDebounced();
+		};
+		panelHead.addEventListener('pointerup', endPanelDrag);
+		panelHead.addEventListener('pointercancel', endPanelDrag);
+
 		buildDrawer();       // 挂到「扩展设置」页
 		syncControls();      // 两处控件的初值统一写入
 
@@ -622,7 +660,7 @@ function boot() {
 			if (e.button !== 0) { return; }
 			const rect = pill.getBoundingClientRect();
 			drag = { sx: e.clientX, sy: e.clientY, ox: rect.left, oy: rect.top, moved: false };
-			pill.setPointerCapture(e.pointerId);
+			try { pill.setPointerCapture(e.pointerId); } catch { /* 合成事件/无活动指针时忽略 */ }
 		});
 		pill.addEventListener('pointermove', (e) => {
 			if (!drag) { return; }
@@ -679,6 +717,24 @@ function boot() {
 		}
 		document.addEventListener('visibilitychange', () => {
 			if (!document.hidden) { clampPillPos(); }
+		});
+		// 面板已拖过位时，窗口/视口变化也要把面板拉回可视区
+		const clampPanelPos = () => {
+			if (!panel || panel.style.display !== 'flex') { return; }
+			if (!Number.isFinite(settings.panelX) || !Number.isFinite(settings.panelY)) { return; }
+			if (panelDrag) { return; }
+			const r = panel.getBoundingClientRect();
+			const p = clampToViewport(r.left, r.top, r.width, r.height);
+			panel.style.left = `${p.x}px`;
+			panel.style.top = `${p.y}px`;
+		};
+		window.addEventListener('resize', clampPanelPos);
+		window.addEventListener('orientationchange', () => setTimeout(clampPanelPos, 300));
+		if (window.visualViewport) {
+			window.visualViewport.addEventListener('resize', clampPanelPos);
+		}
+		document.addEventListener('visibilitychange', () => {
+			if (!document.hidden) { clampPanelPos(); }
 		});
 		setInterval(tick, 400);
 		tick();
@@ -852,14 +908,24 @@ function boot() {
 	}
 
 	function positionPanel() {
-		const pr = pill.getBoundingClientRect();
-		let x = pr.left - 8;
-		let y = pr.top - 8;
 		panel.style.visibility = 'hidden';
 		panel.style.display = 'flex';
 		const pw = panel.offsetWidth;
 		const ph = panel.offsetHeight;
 		panel.style.visibility = '';
+
+		// 拖过的面板记住位置（按实际尺寸钳制，防止换设备后跑到屏幕外）
+		if (Number.isFinite(settings.panelX) && Number.isFinite(settings.panelY)) {
+			const p = clampToViewport(settings.panelX, settings.panelY, pw, ph);
+			panel.style.left = `${p.x}px`;
+			panel.style.top = `${p.y}px`;
+			return;
+		}
+
+		// 没拖过：默认出现在状态球旁边
+		const pr = pill.getBoundingClientRect();
+		let x = pr.left - 8;
+		let y = pr.top - 8;
 		if (x + pw > window.innerWidth - 8) { x = window.innerWidth - pw - 8; }
 		if (y + ph > window.innerHeight - 8) { y = Math.max(8, window.innerHeight - ph - 8); }
 		panel.style.left = `${Math.max(8, x)}px`;
