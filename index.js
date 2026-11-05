@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.6.0-2026-11-05';
+const VERSION = 'v1.6.1-2026-11-05';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -1067,6 +1067,15 @@ function boot() {
 		renderHistory();
 	}
 
+	// 展开详情的内容指纹：errDetail 异步到位、head 流式增长时版本号变化，才允许重建详情块
+	function detailVer(rec) {
+		if (hasErrDetail(rec)) {
+			const d = rec.errDetail;
+			return `e:${(d.body || '').length}:${d.message || ''}`;
+		}
+		return `r:${(rec.head || '').length}`;
+	}
+
 	function renderHistory() {
 		const box = panel.querySelector('#stcm-history');
 		if (!box) { return; }
@@ -1074,14 +1083,80 @@ function boot() {
 			box.dataset.stcmBound = '1';
 			box.addEventListener('click', onHistoryClick);
 		}
-		// 每 400ms 全量重绘会打断用户滚动：重绘前后保持滚动位置
+		// 每 400ms 重绘会打断用户滚动：重绘前后保持滚动位置
 		const scroller = box.closest('.stcm-hist');
 		const keepTop = scroller ? scroller.scrollTop : 0;
 		const atBottom = scroller ? (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4) : false;
+
 		const rows = [...activeMap.values()].reverse().concat(history).slice(0, 20);
-		box.innerHTML = rows.length
-			? rows.map(historyRow).join('')
-			: '<div class="stcm-hint">还没有请求记录。发一条消息试试。</div>';
+		if (!rows.length) {
+			box.replaceChildren();
+			box.innerHTML = '<div class="stcm-hint">还没有请求记录。发一条消息试试。</div>';
+			return;
+		}
+
+		// 增量更新：已展开的详情块尽量保留原 DOM —— 否则 innerHTML 全量重建会把
+		// .stcm-raw 的滚动位置每 400ms 重置一次，内容长时根本滚不下去（触摸拖动也会被打断）
+		const existing = new Map();
+		box.querySelectorAll('.stcm-item[data-stcm-id]').forEach((el) => existing.set(el.getAttribute('data-stcm-id'), el));
+		const tmp = document.createElement('div');
+
+		// 先为每条记录准备目标节点（能复用就复用）
+		const targets = rows.map((rec) => {
+			const key = String(rec.id);
+			const old = existing.get(key) || null;
+			existing.delete(key);
+			return { rec, old };
+		});
+
+		// 顺序与节点都完全没变 -> 原位更新，一个节点都不移动（滚动位置绝对安全）
+		const sameOrder = box.children.length === targets.length
+			&& targets.every((t, i) => t.old && box.children[i] === t.old);
+
+		if (sameOrder) {
+			for (const { rec, old } of targets) {
+				const wantOpen = expandedIds.has(rec.id) && canShowDetail(rec);
+				const ver = detailVer(rec);
+				const keepDetail = wantOpen && old.querySelector('.stcm-detail') && old.getAttribute('data-stcm-dv') === ver;
+				tmp.innerHTML = historyRow(rec);
+				const newRow = tmp.firstElementChild.querySelector('.stcm-row');
+				const newDetail = tmp.firstElementChild.querySelector('.stcm-detail');
+				const curRow = old.querySelector('.stcm-row');
+				// 头部变了才替换（避免每 400ms 重建导致 hover 闪烁）
+				if (curRow && newRow && curRow.innerHTML !== newRow.innerHTML) {
+					curRow.replaceWith(newRow);
+				}
+				if (wantOpen && !keepDetail) {
+					// 详情刚展开或内容版本变化：原位替换 detail（位置不变，只丢这一次滚动）
+					const curDetail = old.querySelector('.stcm-detail');
+					if (newDetail) {
+						if (curDetail) { curDetail.replaceWith(newDetail); } else { old.appendChild(newDetail); }
+						old.setAttribute('data-stcm-dv', ver);
+					}
+				} else if (!wantOpen && old.getAttribute('data-stcm-dv')) {
+					const curDetail = old.querySelector('.stcm-detail');
+					if (curDetail) { curDetail.remove(); }
+					old.removeAttribute('data-stcm-dv');
+				}
+			}
+		} else {
+			// 新记录到来 / 行被挤出：重排。此帧展开行的滚动会丢，属可接受的偶发
+			const frag = document.createDocumentFragment();
+			for (const { rec, old } of targets) {
+				const wantOpen = expandedIds.has(rec.id) && canShowDetail(rec);
+				if (old && wantOpen && old.querySelector('.stcm-detail') && old.getAttribute('data-stcm-dv') === detailVer(rec)) {
+					// 保留旧节点（移动会丢滚动，但此分支只在重排帧发生）
+					frag.appendChild(old);
+				} else {
+					tmp.innerHTML = historyRow(rec);
+					const nu = tmp.firstElementChild;
+					if (wantOpen) { nu.setAttribute('data-stcm-dv', detailVer(rec)); }
+					frag.appendChild(nu);
+				}
+			}
+			box.replaceChildren(frag);
+		}
+
 		if (scroller) {
 			// 用户本来贴着底部看最新记录 -> 重绘后继续贴底；否则恢复原滚动位置
 			scroller.scrollTop = atBottom ? scroller.scrollHeight : keepTop;
