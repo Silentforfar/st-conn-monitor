@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.7.0-2026-11-05';
+const VERSION = 'v1.7.1-2026-11-14';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -736,7 +736,29 @@ function boot() {
 		document.addEventListener('visibilitychange', () => {
 			if (!document.hidden) { clampPanelPos(); }
 		});
-		setInterval(tick, 400);
+		// 计时器放 Web Worker 里：页面失焦/切到后台时浏览器会把主线程的 setInterval
+		// 强制节流（最狠压到 1 次/分钟），导致计时不动、断流告警延迟甚至误报。
+		// Worker 的定时器不受页面生命周期节流，由它每 400ms 通知主线程跑一次 tick。
+		let tickWorker = null;
+		function startTicker() {
+			try {
+				const src = 'let id=null;self.onmessage=(e)=>{if(e.data==="start"){clearInterval(id);id=setInterval(()=>self.postMessage(1),400);}else if(e.data==="stop"){clearInterval(id);id=null;}};';
+				tickWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+				tickWorker.onmessage = () => tick();
+				tickWorker.postMessage('start');
+			} catch (err) {
+				// Worker 不可用（CSP / 老浏览器）→ 回退普通定时器
+				console.warn(TAG, 'Worker 计时器不可用，回退 setInterval:', err);
+				setInterval(tick, 400);
+			}
+		}
+		startTicker();
+
+		// 回到前台/窗口重新获得焦点时，立刻刷新一次状态（并校正位置）
+		window.addEventListener('focus', () => { clampPillPos(); clampPanelPos(); tick(); });
+		document.addEventListener('visibilitychange', () => {
+			if (!document.hidden) { tick(); }
+		});
 		tick();
 	}
 
