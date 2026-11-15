@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.7.3-2026-11-15';
+const VERSION = 'v1.8.0-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -82,6 +82,9 @@ function boot() {
 	// 成功请求也只留开头这么多字符，用于确认「这一帧到底回了什么」
 	const HEAD_LIMIT = 1200;
 
+	// 下游（酒馆）迟迟不消费时，最多先替它缓存这么多字节，超过就暂停读上游
+	const BUFFER_LIMIT = 8 * 1024 * 1024;
+
 	const activeMap = new Map();   // id -> record（进行中）
 	const history = [];            // 已结束，新的在前，上限 40
 	let uid = 0;
@@ -113,6 +116,8 @@ function boot() {
 			errDetail: null,      // 失败详情：{ status, statusText, errorCode, message, body }
 			head: '',             // 响应开头（最多 HEAD_LIMIT 字符），成功时也能点开看
 			tokens: 0,            // 生成结束后用酒馆 tokenizer 数出来的真实 token 数
+			buffered: 0,          // 已从上游读到、但下游还没取走的字节数（内存保护用）
+			backpressure: false,  // 下游是否没在积极消费（true=界面滞后，false=下游在等数据）
 		};
 		rec.lastData = rec.start;
 		activeMap.set(rec.id, rec);
@@ -135,6 +140,7 @@ function boot() {
 		if (history.length > 40) {
 			history.length = 40;
 		}
+		rec.buffered = 0;
 		lastFinished = rec;
 		if (rec.state === 'done') {
 			scheduleTokenCount(rec);
@@ -238,40 +244,63 @@ function boot() {
 			const dec = new TextDecoder('utf-8');
 			const reader = resp.body.getReader();
 
-			// 手动泵流：读到 done 就当场收尾。
-			// 不用 pipeThrough + 轮询 —— 那种写法在「一次性返回」的响应上 flush 可能不触发，
-			// 记录会一直卡在「生成中」，永远进不了可展开的历史。
+			// 主动泵流：由扩展自己不断读上游，而不是等下游（酒馆）来 read 才动。
+			//
+			// 为什么不能用 pull 驱动：pull 只在消费者调用 read() 时才触发。酒馆在后台标签页
+			// 时渲染被浏览器节流、读得慢甚至不读，pull 就不会被调用 → lastData 不更新 →
+			// 面板误报「长时间无数据·疑似断流」，而实际上数据一直堆在缓冲区里等着。
+			// （实测：后台 10 秒仍能收到 40/40 块，流读取本身不受节流影响。）
+			//
+			// 现在改为：上游数据一到就记录（时间戳真实反映上游），再进队列等下游按需取；
+			// 队列积压超过上限才暂停读上游，此时面板显示「本地积压 · 界面滞后」而非断流。
+			// 主动推送模式：扩展自己不断读上游，直接用 controller.enqueue 推给下游。
+			// 不用 pull 驱动 —— pull 返回的 Promise resolve 后，若流内部队列已满，
+			// 浏览器不会继续调用 pull，会出现「队列有数据、下游却取不到」的死锁（实测复现）。
+			let upstreamDone = false;
 			const pumped = new ReadableStream({
-				async pull(controller) {
-					try {
-						const { done, value } = await reader.read();
-						if (done) {
+				start(controller) {
+					(async () => {
+						try {
+							while (true) {
+								// 内存保护：下游长期不消费时暂停读上游（单位是「块」，够用且简单）
+								while (controller.desiredSize !== null && controller.desiredSize < -2000) {
+									rec.backpressure = true;
+									await new Promise((r) => setTimeout(r, 100));
+								}
+								const { done, value } = await reader.read();
+								if (done) {
+									upstreamDone = true;
+									if (!rec.end) {
+										rec.state = rec.status >= 200 && rec.status < 300 ? 'done' : 'error';
+										finish(rec);
+									}
+									controller.close();
+									return;
+								}
+								rec.bytes += value.byteLength || 0;
+								rec.chunks += 1;
+								rec.lastData = performance.now();   // 上游真实数据到达时间
+								try {
+									const txt = dec.decode(value, { stream: true });
+									// 只留开头一小段：够看出这一帧是不是正常内容，又不占内存
+									if (txt && rec.head.length < HEAD_LIMIT) {
+										rec.head += txt;
+									}
+								} catch { /* 解码失败不影响计数 */ }
+								controller.enqueue(value);
+								// desiredSize <= 0 表示下游没在积极消费（后台标签页渲染被节流）
+								const ds = controller.desiredSize;
+								rec.backpressure = ds !== null && ds <= 0;
+							}
+						} catch (err) {
 							if (!rec.end) {
-								rec.state = rec.status >= 200 && rec.status < 300 ? 'done' : 'error';
+								rec.state = 'aborted';
+								rec.note = '读取中断';
 								finish(rec);
 							}
-							controller.close();
-							return;
+							try { controller.error(err); } catch { /* ignore */ }
 						}
-						rec.bytes += value.byteLength || 0;
-						rec.chunks += 1;
-						rec.lastData = performance.now();
-						try {
-							const txt = dec.decode(value, { stream: true });
-							// 只留开头一小段：够看出这一帧是不是正常内容，又不占内存
-							if (txt && rec.head.length < HEAD_LIMIT) {
-								rec.head += txt;
-							}
-						} catch { /* 解码失败不影响计数 */ }
-						controller.enqueue(value);
-					} catch (err) {
-						if (!rec.end) {
-							rec.state = 'aborted';
-							rec.note = '读取中断';
-							finish(rec);
-						}
-						controller.error(err);
-					}
+					})();
 				},
 				cancel(reason) {
 					try { reader.cancel(reason); } catch { /* ignore */ }
@@ -973,8 +1002,20 @@ function boot() {
 		}
 		// receiving
 		const since = now - rec.lastData;
-		if (since >= dead2) { return { cls: 'stcm-dead', text: `${fmtSec(since)} 无数据 · 疑似断流` }; }
-		if (since >= dead1) { return { cls: 'stcm-warn', text: `${fmtSec(since)} 无新数据 · ${fmtBytes(rec.bytes)}` }; }
+		if (since >= dead2) {
+			// 下游正等着要数据（desiredSize>0）却等不到 → 上游真断流
+			if (!rec.backpressure) {
+				return { cls: 'stcm-dead', text: `${fmtSec(since)} 无数据 · 疑似断流` };
+			}
+			// 下游自己没在消费（后台标签页渲染被节流）→ 不是断流，是界面滞后
+			return { cls: 'stcm-warn', text: `界面滞后 · 上游已 ${fmtSec(since)} 无新数据` };
+		}
+		if (since >= dead1) {
+			if (rec.backpressure) {
+				return { cls: 'stcm-warn', text: `界面滞后 · 待消费 ${fmtBytes(rec.buffered)}` };
+			}
+			return { cls: 'stcm-warn', text: `${fmtSec(since)} 无新数据 · ${fmtBytes(rec.bytes)}` };
+		}
 		return { cls: 'stcm-flow', text: `生成中 ${fmtSec(now - rec.start)} · ${rec.chunks} 块` };
 	}
 
