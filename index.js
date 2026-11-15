@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.7.2-2026-11-15';
+const VERSION = 'v1.7.3-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -531,7 +531,7 @@ function boot() {
 #stcm-panel .stcm-loglink:hover{opacity:1}
 #stcm-selftest{margin-top:6px;opacity:.62;font-size:12px}
 /* ---------- 扩展设置页（插件页）里的区块：沿用酒馆原生 .inline-drawer 折叠 ---------- */
-#stcm-drawer{margin-bottom:10px;color:inherit}
+#stcm-drawer{margin-bottom:5px;color:inherit}
 #stcm-drawer.inline-drawer > .inline-drawer-toggle.inline-drawer-header{margin-bottom:0}
 #stcm-drawer > .inline-drawer-content{padding-top:5px}
 /* 酒馆没给 content 写 display:none，必须自加，否则首次渲染就是摊开状态 */
