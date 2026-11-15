@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.11.3-2026-11-15';
+const VERSION = 'v1.11.4-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -139,6 +139,7 @@ function boot() {
 		const dur = o.dur || 0;
 		const start = performance.now() - dur;
 		const startWall = o.startWall ? new Date(o.startWall) : new Date(Date.now() - dur);
+		if (o.model) { o.model = decodeJsonString(o.model); }
 		return Object.assign({}, o, {
 			startWall,
 			start,
@@ -190,6 +191,16 @@ function boot() {
 		return model;
 	}
 
+	// 把正则抠出来的 JSON 字符串内容还原（处理 \uXXXX、\n 等转义）
+	function decodeJsonString(raw) {
+		if (!raw || !raw.includes('\\')) { return raw; }
+		try {
+			return JSON.parse(`"${raw}"`);
+		} catch {
+			return raw;
+		}
+	}
+
 	// 从流数据里扫出结束原因、token 用量、正文长度（轻量正则，不 JSON.parse 每一块）
 	function scanChunk(rec, txt) {
 		if (!txt) { return; }
@@ -204,7 +215,11 @@ function boot() {
 		m = /"completion_tokens"\s*:\s*(\d+)/.exec(buf);
 		if (m) { rec.completionTokens = Number(m[1]); }
 		m = /"model"\s*:\s*"([^"]+)"/.exec(buf);
-		if (m && m[1]) { rec.model = m[1]; }
+		if (m && m[1]) {
+			// JSON 里中文常被写成 \uXXXX 转义，直接取原文会显示成「\u6297\u622a\u65ad」，
+			// 借 JSON.parse 还原成正常文字
+			rec.model = decodeJsonString(m[1]);
+		}
 
 		// 正文长度只统计当前块，避免和 scanTail 重复计数
 		const re = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
