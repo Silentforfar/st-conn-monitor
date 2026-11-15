@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.8.0-2026-11-15';
+const VERSION = 'v1.8.1-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -1032,9 +1032,31 @@ function boot() {
 	let titleFlashed = false;
 	const origTitle = document.title;
 
+	// 酒馆的楼层计时只在「收到流数据」时刷新（onProgressStreaming → formatGenerationTimer），
+	// 上游一旦静默、或界面在后台被节流，时间就冻在最后一次数据的时刻，直到点取消才跳到最终值。
+	// 这里由扩展按固定节奏自己刷新，时间点持续走，与监视器同步。
+	function syncMessageTimer() {
+		if (!activeMap.size) { return; }
+		let last = null;
+		try {
+			last = globalThis.SillyTavern?.getContext?.()?.chat?.at?.(-1) || null;
+		} catch { /* ignore */ }
+		if (!last || last.is_user || last.is_system) { return; }
+		const started = last.gen_started;
+		if (!started) { return; }
+		const secs = (Date.now() - new Date(started).getTime()) / 1000;
+		if (!Number.isFinite(secs) || secs < 0) { return; }
+		const el = document.querySelector('#chat .mes:last-of-type .mes_timer');
+		if (!el) { return; }
+		const txt = `${secs.toFixed(1)}s`;
+		if (el.textContent !== txt) { el.textContent = txt; }
+	}
+
 	function tick() {
 		const latest = [...activeMap.values()].pop();
 		let cls = '', show = false;
+
+		syncMessageTimer();
 
 		if (latest) {
 			const v = classify(latest);
