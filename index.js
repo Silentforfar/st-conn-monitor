@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.10.0-2026-11-15';
+const VERSION = 'v1.11.0-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -119,6 +119,7 @@ function boot() {
 			chunks: rec.chunks,
 			tokens: rec.tokens,
 			note: rec.note || '',
+			model: rec.model || '',
 			finishReason: rec.finishReason || '',
 			promptTokens: rec.promptTokens || 0,
 			completionTokens: rec.completionTokens || 0,
@@ -172,17 +173,21 @@ function boot() {
 
 	// 给流式请求补 stream_options.include_usage：官方兼容端点只有带上它才会在流末尾返回
 	// prompt_tokens / completion_tokens。只处理普通对象 body，Request 对象或非 JSON 一律不动。
+	// 顺便把请求里的模型名带出来（响应里通常也有，但部分中转不给）
 	function maybeRequestUsage(args) {
+		let model = '';
 		try {
-			if (!settings.requestUsage) { return; }
 			const cfg = args[1];
-			if (!cfg || typeof cfg.body !== 'string') { return; }
+			if (!cfg || typeof cfg.body !== 'string') { return model; }
 			const body = JSON.parse(cfg.body);
-			if (!body || body.stream !== true) { return; }
-			if (body.stream_options && body.stream_options.include_usage === true) { return; }
+			if (!body) { return model; }
+			if (body.model) { model = String(body.model); }
+			if (!settings.requestUsage || body.stream !== true) { return model; }
+			if (body.stream_options && body.stream_options.include_usage === true) { return model; }
 			body.stream_options = Object.assign({}, body.stream_options, { include_usage: true });
 			args[1] = Object.assign({}, cfg, { body: JSON.stringify(body) });
 		} catch { /* 非 JSON 或结构异常：原样发送 */ }
+		return model;
 	}
 
 	// 从流数据里扫出结束原因、token 用量、正文长度（轻量正则，不 JSON.parse 每一块）
@@ -198,6 +203,8 @@ function boot() {
 		if (m) { rec.promptTokens = Number(m[1]); }
 		m = /"completion_tokens"\s*:\s*(\d+)/.exec(buf);
 		if (m) { rec.completionTokens = Number(m[1]); }
+		m = /"model"\s*:\s*"([^"]+)"/.exec(buf);
+		if (m && m[1]) { rec.model = m[1]; }
 
 		// 正文长度只统计当前块，避免和 scanTail 重复计数
 		const re = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
@@ -238,6 +245,7 @@ function boot() {
 			tokens: 0,            // 生成结束后用酒馆 tokenizer 数出来的真实 token 数
 			buffered: 0,          // 已从上游读到、但下游还没取走的字节数（内存保护用）
 			backpressure: false,  // 下游是否没在积极消费（true=界面滞后，false=下游在等数据）
+			model: '',            // 本次请求的模型名（优先取响应里给的，其次请求体）
 			finishReason: '',     // 上游给的结束原因：stop / length / content_filter / tool_calls
 			promptTokens: 0,      // 本次请求的输入 token（来自响应 usage）
 			completionTokens: 0,  // 本次输出 token
@@ -306,9 +314,10 @@ function boot() {
 
 		// 官方兼容端点默认不在流里返回 token 用量，补一个 stream_options 才能拿到 prompt_tokens
 		// （上下文占用条要用）。改不动就原样发，绝不影响请求。
-		maybeRequestUsage(args);
+		const reqModel = maybeRequestUsage(args);
 
 		const rec = beginRecord(url, method);
+		if (reqModel) { rec.model = reqModel; }
 
 		try {
 			const resp = await origFetch(...args);
@@ -1373,9 +1382,11 @@ function boot() {
 		const stText = `HTTP ${rec.status || '?'}${rec.state === 'aborted' ? ' · 已停止' : ''}`;
 		kv.push(`<div class="stcm-kv"><span>状态</span><b>${escHtml(stText)}</b></div>`);
 		kv.push(`<div class="stcm-kv"><span>请求</span><b>${escHtml(rec.short)}</b></div>`);
-		kv.push(`<div class="stcm-kv"><span>首字节</span><b>${fmtSec(rec.ttfb)}</b></div>`);
-		kv.push(`<div class="stcm-kv"><span>总耗时</span><b>${fmtSec(dur)}</b></div>`);
-		kv.push(`<div class="stcm-kv"><span>数据量</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块${rec.tokens > 0 ? ` · ${rec.tokens} token` : ''}</b></div>`);
+		if (rec.model) {
+			kv.push(`<div class="stcm-kv"><span>模型</span><b>${escHtml(rec.model)}</b></div>`);
+		}
+		kv.push(`<div class="stcm-kv"><span>耗时</span><b>${fmtSec(dur)} · 首字节 ${fmtSec(rec.ttfb)}</b></div>`);
+		kv.push(`<div class="stcm-kv"><span>数据</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块</b></div>`);
 		if (rec.finishReason) {
 			kv.push(`<div class="stcm-kv"><span>结束</span><b>${escHtml(finishLabel(rec.finishReason))}</b></div>`);
 		}
@@ -1383,17 +1394,9 @@ function boot() {
 			kv.push(`<div class="stcm-kv"><span>用量</span><b>输入 ${(rec.promptTokens || 0).toLocaleString()} · 输出 ${(rec.completionTokens || 0).toLocaleString()}</b></div>`);
 		}
 		const durSec = dur / 1000;
-		if (durSec > 0.15) {
-			const speed = [];
-			if (rec.bytes > 0) {
-				speed.push(`${fmtBytes(Math.round(rec.bytes / durSec))}/s`);
-			}
-			if (rec.tokens > 0) {
-				speed.push(`${fmtRate(rec.tokens / durSec)} token/s`);
-			}
-			if (speed.length) {
-				kv.push(`<div class="stcm-kv"><span>速度</span><b>${speed.join(' · ')}</b></div>`);
-			}
+		// 只报 token 速度：字节速度在不同编码/压缩下没什么参考价值
+		if (rec.tokens > 0 && durSec > 0.15) {
+			kv.push(`<div class="stcm-kv"><span>速度</span><b>${fmtRate(rec.tokens / durSec)} token/s</b></div>`);
 		} else if (rec.tokens > 0) {
 			kv.push(`<div class="stcm-kv"><span>速度</span><b>—（耗时太短，不具参考性）</b></div>`);
 		}
@@ -1429,10 +1432,23 @@ function boot() {
 </div>`;
 	}
 
+	// 在详情里选字准备复制时，不要因为这次点击把详情收起来
+	let suppressToggle = false;
+	function selectionInsidePanel() {
+		try {
+			const sel = window.getSelection?.();
+			return !!(sel && String(sel).length > 0 && sel.anchorNode && panel.contains(sel.anchorNode));
+		} catch { return false; }
+	}
+
 	function onHistoryClick(e) {
 		// 点日志链接时不触发展开收合
 		if (e.target.closest('a')) { return; }
-		const item = e.target.closest('.stcm-item');
+		if (suppressToggle) { suppressToggle = false; return; }
+		// 只有点标题行才开合；点详情内容（常见于要选文字复制）不响应
+		const row = e.target.closest('.stcm-row');
+		if (!row) { return; }
+		const item = row.closest('.stcm-item');
 		if (!item) { return; }
 		const id = Number(item.getAttribute('data-stcm-id'));
 		if (!id) { return; }
@@ -1499,6 +1515,8 @@ function boot() {
 		if (!box) { return; }
 		if (!box.dataset.stcmBound) {
 			box.dataset.stcmBound = '1';
+			box.addEventListener('pointerdown', () => { suppressToggle = selectionInsidePanel(); });
+			box.addEventListener('pointerup', () => { if (selectionInsidePanel()) { suppressToggle = true; } });
 			box.addEventListener('click', onHistoryClick);
 		}
 		// 每 400ms 重绘会打断用户滚动：重绘前后保持滚动位置
