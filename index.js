@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.11.4-2026-11-15';
+const VERSION = 'v1.12.0-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -222,9 +222,24 @@ function boot() {
 		}
 
 		// 正文长度只统计当前块，避免和 scanTail 重复计数
-		const re = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
 		let cm;
-		while ((cm = re.exec(txt))) { rec.contentChars += cm[1].length; }
+		// ① OpenAI 流式：choices[].delta.content
+		const reContent = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+		while ((cm = reContent.exec(txt))) { rec.contentChars += cm[1].length; }
+		// ② tool_calls 的 arguments（破限预设常把正文放这里）
+		const reArgs = /"arguments"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+		while ((cm = reArgs.exec(txt))) { rec.argChars = (rec.argChars || 0) + cm[1].length; }
+		// ③ Gemini 原生：candidates[].content.parts[].text
+		const reText = /"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+		while ((cm = reText.exec(txt))) { rec.contentChars += cm[1].length; }
+
+		// Gemini 的收尾字段：finishReason 大写枚举 + usageMetadata 的 token 统计
+		m = /"finishReason"\s*:\s*"([A-Z_]+)"/.exec(buf);
+		if (m && m[1] && GEMINI_FINISH[m[1]]) { rec.finishReason = GEMINI_FINISH[m[1]]; }
+		m = /"promptTokenCount"\s*:\s*(\d+)/.exec(buf);
+		if (m) { rec.promptTokens = Number(m[1]); }
+		m = /"candidatesTokenCount"\s*:\s*(\d+)/.exec(buf);
+		if (m) { rec.completionTokens = Number(m[1]); }
 	}
 
 	const activeMap = new Map();   // id -> record（进行中）
@@ -286,7 +301,10 @@ function boot() {
 				|| (rec.argChars || 0) > 0
 				|| (rec.completionTokens || 0) > 0
 				|| rec.finishReason === 'tool_calls'
-				|| rec.finishReason === 'function_call';
+				|| rec.finishReason === 'function_call'
+				// 兜底：任何响应形式（含将来新增的格式）只要体积够大就一定是有产出的，
+				// 真正的「空响应」通常只有几百字节的元数据
+				|| (rec.bytes || 0) > 4096;
 			if (!wroteSomething) {
 				rec.state = 'empty';
 				rec.note = rec.finishReason ? `空响应 · ${rec.finishReason}` : '空响应';
@@ -1360,6 +1378,19 @@ function boot() {
 	}
 
 	// 上游结束原因的中文解释
+	// Gemini 原生格式的 finishReason 是大写枚举，映射成 OpenAI 那套说法
+	const GEMINI_FINISH = {
+		STOP: 'stop',
+		MAX_TOKENS: 'length',
+		SAFETY: 'content_filter',
+		RECITATION: 'content_filter',
+		BLOCKLIST: 'content_filter',
+		PROHIBITED_CONTENT: 'content_filter',
+		SPII: 'content_filter',
+		MALFORMED_FUNCTION_CALL: 'tool_calls',
+		OTHER: '',
+	};
+
 	const FINISH_TEXT = {
 		stop: '正常结束',
 		length: '达到长度上限，被截断',
