@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.9.0-2026-11-15';
+const VERSION = 'v1.9.1-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -176,7 +176,8 @@ function boot() {
 			finishReason: '',     // 上游给的结束原因：stop / length / content_filter / tool_calls
 			promptTokens: 0,      // 本次请求的输入 token（来自响应 usage）
 			completionTokens: 0,  // 本次输出 token
-			contentChars: 0,      // 从流里累计到的正文长度，用来判定「空响应」
+			contentChars: 0,      // 从流里累计到的正文长度（content 字段）
+			argChars: 0,          // tool_calls 的 arguments 长度（破限预设把正文放这儿）
 			scanTail: '',         // 上一块尾部 200 字，用于跨块匹配 finish_reason / usage
 		};
 		rec.lastData = rec.start;
@@ -190,10 +191,18 @@ function boot() {
 			return;
 		}
 		rec.end = performance.now();
-		// 空响应：HTTP 成功、但正文一个字都没来（常见于上游内容拦截）
-		if (rec.state === 'done' && (rec.contentChars || 0) === 0) {
-			rec.state = 'empty';
-			rec.note = rec.finishReason ? `空响应 · ${rec.finishReason}` : '空响应';
+		// 空响应：HTTP 成功、但确实没有任何产出。要同时排除这些「有内容」的形态：
+		// 正文 content、tool_calls 的 arguments（破限预设常用）、输出 token > 0、结束原因为工具调用
+		if (rec.state === 'done') {
+			const wroteSomething = (rec.contentChars || 0) > 0
+				|| (rec.argChars || 0) > 0
+				|| (rec.completionTokens || 0) > 0
+				|| rec.finishReason === 'tool_calls'
+				|| rec.finishReason === 'function_call';
+			if (!wroteSomething) {
+				rec.state = 'empty';
+				rec.note = rec.finishReason ? `空响应 · ${rec.finishReason}` : '空响应';
+			}
 		}
 		if (rec.head && rec.head.length > HEAD_LIMIT) {
 			rec.head = rec.head.slice(0, HEAD_LIMIT);
@@ -208,7 +217,13 @@ function boot() {
 		rec.buffered = 0;
 		lastFinished = rec;
 		if (rec.state === 'done') {
-			scheduleTokenCount(rec);
+			// 响应里给了精确的输出 token 就直接用；否则才回退到酒馆分词器估算
+			if (rec.completionTokens > 0) {
+				rec.tokens = rec.completionTokens;
+				rec.tokensApprox = false;
+			} else {
+				scheduleTokenCount(rec);
+			}
 		}
 		renderPanel();
 	}
@@ -555,7 +570,9 @@ function boot() {
 				const counter = await getTokenizer();
 				if (!counter) { return; }
 				const n = await counter(text, 0);
-				if (n > 0) {
+				// 合理性检查：中文 1 token 至少 2 字节，数出的 token 超过响应字节数说明
+				// 数到的是整条消息（续写场景），不是本次返回，宁可不用也不显示假数据
+				if (n > 0 && n <= rec.bytes) {
 					rec.tokens = n;
 					rec.tokensApprox = false;
 					renderPanel();
@@ -584,7 +601,7 @@ function boot() {
 #stcm-pill.stcm-abort .stcm-dot{background:color-mix(in srgb,var(--SmartThemeBodyColor,#888) 45%,transparent)}
 @keyframes stcm-blink{0%,100%{opacity:1}50%{opacity:.25}}
 #stcm-panel{position:fixed;z-index:60001;display:none;flex-direction:column;width:430px;max-width:94vw;max-height:70vh;overflow:hidden;
- background:var(--SmartThemeBlurTintColor,rgba(24,26,32,.96));color:var(--SmartThemeBodyColor,#e8eaf0);border-radius:12px;border:1px solid var(--SmartThemeBorderColor,rgba(255,255,255,.12));
+ background-color:#16180f;background-image:linear-gradient(var(--SmartThemeBlurTintColor,rgba(24,26,32,.96)),var(--SmartThemeBlurTintColor,rgba(24,26,32,.96)));color:var(--SmartThemeBodyColor,#e8eaf0);border-radius:12px;border:1px solid var(--SmartThemeBorderColor,rgba(255,255,255,.12));
  box-shadow:0 8px 32px rgba(0,0,0,.3);font-size:13px;backdrop-filter:blur(16px) saturate(1.15);-webkit-backdrop-filter:blur(16px) saturate(1.15)}
 #stcm-panel h3{margin:0;padding:12px 14px 8px;font-size:14px;display:flex;justify-content:space-between;align-items:center;flex:0 0 auto;
  cursor:move;user-select:none;-webkit-user-select:none;touch-action:none}
@@ -627,8 +644,8 @@ function boot() {
  background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 5%,transparent);
  border:1px solid color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 10%,transparent);
  font-size:11.5px;line-height:1.65}
-#stcm-panel .stcm-kv{display:flex;gap:8px;margin:2px 0}
-#stcm-panel .stcm-kv>span{opacity:.6;flex:0 0 44px}
+#stcm-panel .stcm-kv{display:flex;gap:10px;margin:0;padding:2px 0;align-items:baseline;line-height:1.5}
+#stcm-panel .stcm-kv>span{opacity:.55;flex:0 0 auto;min-width:56px;white-space:nowrap}
 #stcm-panel .stcm-kv>b{font-weight:500;word-break:break-word;min-width:0}
 #stcm-panel .stcm-raw{margin:7px 0 0;padding:7px 9px;max-height:148px;overflow:auto;
  background:color-mix(in srgb,var(--SmartThemeBodyColor,#000) 16%,transparent);border-radius:6px;
@@ -685,10 +702,7 @@ function boot() {
 	<span class="stcm-ctxtxt" id="stcm-ctxtxt">—</span>
 </div>
 <div class="stcm-sec stcm-hist">
-	<div class="stcm-hint">
-		绿点＝数据正在流入，连接活着；黄点＝短暂无新数据；红点＝长时间无数据，疑似断流或失败。<br>
-		「等待响应」＝请求已发出但服务器还没回第一个字节（上游没开腔）。「N 块」＝已收到的数据片段数，流式输出时它持续增长就说明连接活着。
-	</div>
+	<div class="stcm-hint">绿＝流入　黄＝卡顿　红＝断流/失败</div>
 	<div id="stcm-history"></div>
 </div>
 <div class="stcm-sec">
@@ -1280,10 +1294,10 @@ function boot() {
 		kv.push(`<div class="stcm-kv"><span>总耗时</span><b>${fmtSec(dur)}</b></div>`);
 		kv.push(`<div class="stcm-kv"><span>数据量</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块${rec.tokens > 0 ? ` · ${rec.tokens} token` : ''}</b></div>`);
 		if (rec.finishReason) {
-			kv.push(`<div class="stcm-kv"><span>结束原因</span><b>${escHtml(finishLabel(rec.finishReason))}</b></div>`);
+			kv.push(`<div class="stcm-kv"><span>结束</span><b>${escHtml(finishLabel(rec.finishReason))}</b></div>`);
 		}
 		if (rec.promptTokens > 0 || rec.completionTokens > 0) {
-			kv.push(`<div class="stcm-kv"><span>token 用量</span><b>输入 ${rec.promptTokens || 0} · 输出 ${rec.completionTokens || 0}</b></div>`);
+			kv.push(`<div class="stcm-kv"><span>用量</span><b>输入 ${(rec.promptTokens || 0).toLocaleString()} · 输出 ${(rec.completionTokens || 0).toLocaleString()}</b></div>`);
 		}
 		const durSec = dur / 1000;
 		if (durSec > 0.15) {
