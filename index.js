@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.7.1-2026-11-14';
+const VERSION = 'v1.7.2-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -532,9 +532,12 @@ function boot() {
 #stcm-selftest{margin-top:6px;opacity:.62;font-size:12px}
 /* ---------- 扩展设置页（插件页）里的区块：沿用酒馆原生 .inline-drawer 折叠 ---------- */
 #stcm-drawer{margin-bottom:10px;color:inherit}
+#stcm-drawer.inline-drawer > .inline-drawer-toggle.inline-drawer-header{margin-bottom:0}
+#stcm-drawer > .inline-drawer-content{padding-top:5px}
 /* 酒馆没给 content 写 display:none，必须自加，否则首次渲染就是摊开状态 */
 #stcm-drawer .inline-drawer-content{display:none;padding-bottom:8px}
-#stcm-drawer .stcmd-head{display:flex;align-items:baseline;gap:8px;font-size:14px}
+#stcm-drawer .stcmd-head{display:flex;align-items:baseline;gap:8px}
+#stcm-drawer .stcmd-head b{font-size:inherit;font-weight:700}
 #stcm-drawer .stcmd-ver{font-size:11.5px;opacity:.55;font-weight:400}
 #stcm-drawer .stcmd-state{display:flex;align-items:center;gap:7px;margin:7px 0 9px;font-size:12.5px;opacity:.85}
 #stcm-drawer .stcmd-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;
