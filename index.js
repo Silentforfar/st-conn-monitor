@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.11.0-2026-11-15';
+const VERSION = 'v1.11.1-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -719,7 +719,7 @@ function boot() {
  background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 5%,transparent);
  border:1px solid color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 10%,transparent);
  font-size:11.5px;line-height:1.65}
-#stcm-panel .stcm-kv{display:flex;gap:10px;margin:0;padding:2px 0;align-items:baseline;line-height:1.5}
+#stcm-panel .stcm-kv{display:flex;gap:10px;margin:0;padding:1px 0;align-items:baseline;line-height:1.45}
 #stcm-panel .stcm-kv>span{opacity:.55;flex:0 0 auto;min-width:56px;white-space:nowrap}
 #stcm-panel .stcm-kv>b{font-weight:500;word-break:break-word;min-width:0}
 #stcm-panel .stcm-raw{margin:7px 0 0;padding:7px 9px;max-height:148px;overflow:auto;
@@ -1386,20 +1386,16 @@ function boot() {
 			kv.push(`<div class="stcm-kv"><span>模型</span><b>${escHtml(rec.model)}</b></div>`);
 		}
 		kv.push(`<div class="stcm-kv"><span>耗时</span><b>${fmtSec(dur)} · 首字节 ${fmtSec(rec.ttfb)}</b></div>`);
-		kv.push(`<div class="stcm-kv"><span>数据</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块</b></div>`);
-		if (rec.finishReason) {
+		const durSecEarly = dur / 1000;
+		const speedTxt = (rec.tokens > 0 && durSecEarly > 0.15) ? ` · ${fmtRate(rec.tokens / durSecEarly)} token/s` : '';
+		kv.push(`<div class="stcm-kv"><span>数据</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块${speedTxt}</b></div>`);
+		if (rec.finishReason && rec.finishReason !== 'stop') {
 			kv.push(`<div class="stcm-kv"><span>结束</span><b>${escHtml(finishLabel(rec.finishReason))}</b></div>`);
 		}
 		if (rec.promptTokens > 0 || rec.completionTokens > 0) {
 			kv.push(`<div class="stcm-kv"><span>用量</span><b>输入 ${(rec.promptTokens || 0).toLocaleString()} · 输出 ${(rec.completionTokens || 0).toLocaleString()}</b></div>`);
 		}
-		const durSec = dur / 1000;
-		// 只报 token 速度：字节速度在不同编码/压缩下没什么参考价值
-		if (rec.tokens > 0 && durSec > 0.15) {
-			kv.push(`<div class="stcm-kv"><span>速度</span><b>${fmtRate(rec.tokens / durSec)} token/s</b></div>`);
-		} else if (rec.tokens > 0) {
-			kv.push(`<div class="stcm-kv"><span>速度</span><b>—（耗时太短，不具参考性）</b></div>`);
-		}
+
 		const headText = String(rec.head || '').trim();
 		const headBlock = headText
 			? `<div class="stcm-headlabel">返回开头（前 ${Math.min(headText.length, HEAD_LIMIT)} 字）</div><pre class="stcm-raw">${escHtml(headText)}</pre>`
