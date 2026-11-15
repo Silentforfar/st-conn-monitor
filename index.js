@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.8.1-2026-11-15';
+const VERSION = 'v1.9.0-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -51,6 +51,8 @@ function boot() {
 		pinNewMessageTop: true, // 生成结束后把视口停在最新消息开头（而非底部）
 		posX: null,             // 状态球位置（null = 默认右下）
 		posY: null,
+		requestUsage: true,     // 给流式请求补 stream_options.include_usage，换取 token 用量
+		ctxLimit: 0,            // 上下文上限（0 = 跟随酒馆设置）
 		panelX: null,           // 悬浮面板位置（null = 跟随状态球）
 		panelY: null,
 	};
@@ -85,6 +87,59 @@ function boot() {
 	// 下游（酒馆）迟迟不消费时，最多先替它缓存这么多字节，超过就暂停读上游
 	const BUFFER_LIMIT = 8 * 1024 * 1024;
 
+	// 酒馆设置的上下文上限（ctx.maxContext 会给到 8192 这类默认值，不准，
+	// 真实值在设置里的 oai_settings.openai_max_context，启动时异步取一次）
+	let tavernCtxLimit = 0;
+	async function loadCtxLimit() {
+		try {
+			const headers = typeof globalThis.getRequestHeaders === 'function'
+				? globalThis.getRequestHeaders()
+				: { 'Content-Type': 'application/json' };
+			const r = await origFetch('/api/settings/get', { method: 'POST', headers, body: '{}' });
+			const j = await r.json();
+			const v = Number(j?.oai_settings?.openai_max_context);
+			if (Number.isFinite(v) && v > 0) {
+				tavernCtxLimit = v;
+				renderPanel();
+			}
+		} catch { /* 拿不到就显示「上限未知」 */ }
+	}
+
+	// 给流式请求补 stream_options.include_usage：官方兼容端点只有带上它才会在流末尾返回
+	// prompt_tokens / completion_tokens。只处理普通对象 body，Request 对象或非 JSON 一律不动。
+	function maybeRequestUsage(args) {
+		try {
+			if (!settings.requestUsage) { return; }
+			const cfg = args[1];
+			if (!cfg || typeof cfg.body !== 'string') { return; }
+			const body = JSON.parse(cfg.body);
+			if (!body || body.stream !== true) { return; }
+			if (body.stream_options && body.stream_options.include_usage === true) { return; }
+			body.stream_options = Object.assign({}, body.stream_options, { include_usage: true });
+			args[1] = Object.assign({}, cfg, { body: JSON.stringify(body) });
+		} catch { /* 非 JSON 或结构异常：原样发送 */ }
+	}
+
+	// 从流数据里扫出结束原因、token 用量、正文长度（轻量正则，不 JSON.parse 每一块）
+	function scanChunk(rec, txt) {
+		if (!txt) { return; }
+		// finish_reason / usage 可能被拆在相邻两块里，拼上上一块的尾巴再匹配
+		const buf = rec.scanTail + txt;
+		rec.scanTail = buf.slice(-200);
+
+		let m = /"finish_reason"\s*:\s*"([^"]+)"/.exec(buf);
+		if (m) { rec.finishReason = m[1]; }
+		m = /"prompt_tokens"\s*:\s*(\d+)/.exec(buf);
+		if (m) { rec.promptTokens = Number(m[1]); }
+		m = /"completion_tokens"\s*:\s*(\d+)/.exec(buf);
+		if (m) { rec.completionTokens = Number(m[1]); }
+
+		// 正文长度只统计当前块，避免和 scanTail 重复计数
+		const re = /"content"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+		let cm;
+		while ((cm = re.exec(txt))) { rec.contentChars += cm[1].length; }
+	}
+
 	const activeMap = new Map();   // id -> record（进行中）
 	const history = [];            // 已结束，新的在前，上限 40
 	let uid = 0;
@@ -118,6 +173,11 @@ function boot() {
 			tokens: 0,            // 生成结束后用酒馆 tokenizer 数出来的真实 token 数
 			buffered: 0,          // 已从上游读到、但下游还没取走的字节数（内存保护用）
 			backpressure: false,  // 下游是否没在积极消费（true=界面滞后，false=下游在等数据）
+			finishReason: '',     // 上游给的结束原因：stop / length / content_filter / tool_calls
+			promptTokens: 0,      // 本次请求的输入 token（来自响应 usage）
+			completionTokens: 0,  // 本次输出 token
+			contentChars: 0,      // 从流里累计到的正文长度，用来判定「空响应」
+			scanTail: '',         // 上一块尾部 200 字，用于跨块匹配 finish_reason / usage
 		};
 		rec.lastData = rec.start;
 		activeMap.set(rec.id, rec);
@@ -130,6 +190,11 @@ function boot() {
 			return;
 		}
 		rec.end = performance.now();
+		// 空响应：HTTP 成功、但正文一个字都没来（常见于上游内容拦截）
+		if (rec.state === 'done' && (rec.contentChars || 0) === 0) {
+			rec.state = 'empty';
+			rec.note = rec.finishReason ? `空响应 · ${rec.finishReason}` : '空响应';
+		}
 		if (rec.head && rec.head.length > HEAD_LIMIT) {
 			rec.head = rec.head.slice(0, HEAD_LIMIT);
 		}
@@ -157,6 +222,10 @@ function boot() {
 		if (!GEN_URL(url)) {
 			return origFetch(...args);
 		}
+
+		// 官方兼容端点默认不在流里返回 token 用量，补一个 stream_options 才能拿到 prompt_tokens
+		// （上下文占用条要用）。改不动就原样发，绝不影响请求。
+		maybeRequestUsage(args);
 
 		const rec = beginRecord(url, method);
 
@@ -282,9 +351,12 @@ function boot() {
 								rec.lastData = performance.now();   // 上游真实数据到达时间
 								try {
 									const txt = dec.decode(value, { stream: true });
-									// 只留开头一小段：够看出这一帧是不是正常内容，又不占内存
-									if (txt && rec.head.length < HEAD_LIMIT) {
-										rec.head += txt;
+									if (txt) {
+										scanChunk(rec, txt);   // 抓 finish_reason / usage / 正文长度
+										// 只留开头一小段：够看出这一帧是不是正常内容，又不占内存
+										if (rec.head.length < HEAD_LIMIT) {
+											rec.head += txt;
+										}
 									}
 								} catch { /* 解码失败不影响计数 */ }
 								controller.enqueue(value);
@@ -439,7 +511,7 @@ function boot() {
 	function canShowDetail(rec) {
 		if (!rec || !rec.end) { return false; }
 		if (hasErrDetail(rec)) { return true; }
-		return rec.state === 'done' || rec.state === 'aborted';
+		return rec.state === 'done' || rec.state === 'aborted' || rec.state === 'empty';
 	}
 
 	function findRecordById(id) {
@@ -525,6 +597,14 @@ function boot() {
 #stcm-panel .stcm-hist::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 30%,transparent)}
 #stcm-panel .stcm-hist::-webkit-scrollbar-track{background:transparent}
 #stcm-panel .stcm-hint{opacity:.62;font-size:12px;line-height:1.6;margin:4px 0 6px}
+#stcm-panel .stcm-ctx{display:flex;align-items:center;gap:8px;padding:0 14px 8px;font-size:11.5px;flex:0 0 auto}
+#stcm-panel .stcm-ctxlabel{opacity:.6;white-space:nowrap}
+#stcm-panel .stcm-ctxbar{flex:1;height:6px;border-radius:3px;overflow:hidden;
+ background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 12%,transparent)}
+#stcm-panel .stcm-ctxfill{height:100%;width:0;background:#2ecc71;border-radius:3px;transition:width .25s ease,background .25s ease}
+#stcm-panel .stcm-ctxfill.stcm-ctx-warn{background:#f5a623}
+#stcm-panel .stcm-ctxfill.stcm-ctx-dead{background:#ff4d4f}
+#stcm-panel .stcm-ctxtxt{opacity:.75;white-space:nowrap;font-variant-numeric:tabular-nums}
 #stcm-panel label{display:flex;align-items:center;gap:6px;margin:6px 0;opacity:.85}
 #stcm-panel input[type=number]{width:64px;background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 8%,transparent);
  border:1px solid color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 15%,transparent);
@@ -599,6 +679,11 @@ function boot() {
 		panel.id = 'stcm-panel';
 		panel.innerHTML = `
 <h3><span>连接监视器</span><span class="stcm-x" title="关闭">✕</span></h3>
+<div class="stcm-ctx" id="stcm-ctx" title="本次请求的输入 token / 上限">
+	<span class="stcm-ctxlabel">上下文</span>
+	<div class="stcm-ctxbar"><div class="stcm-ctxfill" id="stcm-ctxfill"></div></div>
+	<span class="stcm-ctxtxt" id="stcm-ctxtxt">—</span>
+</div>
 <div class="stcm-sec stcm-hist">
 	<div class="stcm-hint">
 		绿点＝数据正在流入，连接活着；黄点＝短暂无新数据；红点＝长时间无数据，疑似断流或失败。<br>
@@ -614,6 +699,8 @@ function boot() {
 	<label><input type="checkbox" id="stcm-flash"> 卡顿时闪烁标签页标题（后台可见）</label>
 	<label><input type="checkbox" id="stcm-idle"> 空闲时也显示状态球</label>
 	<label><input type="checkbox" id="stcm-pin-top"> 生成结束后停在最新消息开头（不自动置底）</label>
+	<label><input type="checkbox" id="stcm-usage"> 请求流式 token 用量（用于上下文条，默认开）</label>
+	<label>上下文上限 <input type="number" min="0" step="1000" id="stcm-ctx-limit" placeholder="0=跟随酒馆"> token</label>
 	<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
 		<button id="stcm-reset-pos">重置状态球位置</button>
 		<button id="stcm-selftest-btn">链路自检（页面→酒馆）</button>
@@ -645,6 +732,8 @@ function boot() {
 		bindCheck(panel, '#stcm-flash', 'flashTitle');
 		bindCheck(panel, '#stcm-idle', 'showIdle');
 		bindCheck(panel, '#stcm-pin-top', 'pinNewMessageTop');
+		bindCheck(panel, '#stcm-usage', 'requestUsage');
+		bindNum(panel, '#stcm-ctx-limit', 'ctxLimit', 0);
 		panel.querySelector('#stcm-reset-pos').addEventListener('click', resetPillPos);
 		panel.querySelector('#stcm-selftest-btn').addEventListener('click', () => runSelfTest('#stcm-selftest'));
 		panel.querySelector('.stcm-x').addEventListener('click', () => {
@@ -891,6 +980,8 @@ function boot() {
 			set(root, '#stcm-flash, [data-k="flashTitle"]', settings.flashTitle, true);
 			set(root, '#stcm-idle, [data-k="showIdle"]', settings.showIdle, true);
 			set(root, '#stcm-pin-top, [data-k="pinNewMessageTop"]', settings.pinNewMessageTop, true);
+			set(root, '#stcm-usage, [data-k="requestUsage"]', settings.requestUsage, true);
+			set(root, '#stcm-ctx-limit, [data-k="ctxLimit"]', settings.ctxLimit);
 		}
 	}
 
@@ -920,6 +1011,8 @@ function boot() {
 	<label><input type="checkbox" data-k="flashTitle"> 卡顿时闪烁标签页标题（后台可见）</label>
 	<label><input type="checkbox" data-k="showIdle"> 空闲时也显示状态球</label>
 	<label><input type="checkbox" data-k="pinNewMessageTop"> 生成结束后停在最新消息开头（不自动置底）</label>
+	<label><input type="checkbox" data-k="requestUsage"> 请求流式 token 用量（上下文条）</label>
+	<label>上下文上限 <input type="number" min="0" step="1000" data-k="ctxLimit" placeholder="0=跟随酒馆"> token</label>
 	<div class="stcmd-btns">
 		<button class="stcmd-reset">状态球归位</button>
 		<button class="stcmd-test">链路自检（页面→酒馆）</button>
@@ -949,6 +1042,18 @@ function boot() {
 		});
 		drawer.querySelector('[data-k="showIdle"]').addEventListener('change', (e) => {
 			settings.showIdle = e.target.checked;
+			syncControls();
+			saveSettingsDebounced();
+		});
+		drawer.querySelector('[data-k="requestUsage"]').addEventListener('change', (e) => {
+			settings.requestUsage = e.target.checked;
+			syncControls();
+			saveSettingsDebounced();
+		});
+		drawer.querySelector('[data-k="ctxLimit"]').addEventListener('change', (e) => {
+			let v = parseInt(e.target.value, 10);
+			if (!Number.isFinite(v) || v < 0) { v = 0; }
+			settings.ctxLimit = v;
 			syncControls();
 			saveSettingsDebounced();
 		});
@@ -1025,6 +1130,7 @@ function boot() {
 			case 'done': return { cls: 'stcm-done', text: `✓ 完成 ${fmtSec(dur)} · ${rec.chunks} 块` };
 			case 'error': return { cls: 'stcm-dead', text: `✗ 失败 ${rec.note || ''} · ${fmtSec(dur)}` };
 			case 'aborted': return { cls: 'stcm-abort', text: `■ 已停止 · ${fmtSec(dur)}` };
+			case 'empty': return { cls: 'stcm-warn', text: `⚠ ${rec.note || '空响应'} · ${fmtSec(dur)}` };
 			default: return { cls: 'stcm-abort', text: rec.state };
 		}
 	}
@@ -1094,6 +1200,7 @@ function boot() {
 
 		if (panel.style.display === 'flex') {
 			renderHistory();
+			updateContextBar();   // 上限设置改了也要即时反映
 		}
 
 		// 兜底：每 2 秒用「实际渲染位置」校正一次。
@@ -1113,6 +1220,7 @@ function boot() {
 	const STATE_DOT = {
 		receiving: '#2ecc71', wait: '#4da3ff', done: '#2ecc71',
 		error: '#ff4d4f', aborted: '#8a8f9a', warn: '#f5a623', dead: '#ff4d4f',
+		empty: '#f5a623',   // 空响应：HTTP 成功但没正文，用橙色区分于「完成」和「失败」
 	};
 
 	function historyRow(rec) {
@@ -1125,7 +1233,11 @@ function boot() {
 			sub = v.text;
 		} else {
 			const dur = fmtSec(rec.end - rec.start);
-			sub = `${rec.state === 'done' ? '完成' : rec.state === 'error' ? `失败 ${rec.note}` : '已停止'} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
+			const label = rec.state === 'done' ? '完成'
+				: rec.state === 'error' ? `失败 ${rec.note}`
+				: rec.state === 'empty' ? `⚠ ${rec.note || '空响应'}`
+				: '已停止';
+			sub = `${label} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
 		}
 
 		const canExpand = !live && canShowDetail(rec);
@@ -1147,6 +1259,16 @@ function boot() {
 		return `<div class="stcm-item" data-stcm-id="${rec.id}">${head}${detail}</div>`;
 	}
 
+	// 上游结束原因的中文解释
+	const FINISH_TEXT = {
+		stop: '正常结束',
+		length: '达到长度上限，被截断',
+		content_filter: '内容被上游过滤（安全拦截）',
+		tool_calls: '工具调用',
+		function_call: '函数调用',
+	};
+	const finishLabel = (r) => (r ? `${r}${FINISH_TEXT[r] ? ` · ${FINISH_TEXT[r]}` : ''}` : '');
+
 	// 成功 / 主动停止的行：耗时明细 + 返回开头
 	function runDetailHtml(rec) {
 		const dur = rec.end - rec.start;
@@ -1157,6 +1279,12 @@ function boot() {
 		kv.push(`<div class="stcm-kv"><span>首字节</span><b>${fmtSec(rec.ttfb)}</b></div>`);
 		kv.push(`<div class="stcm-kv"><span>总耗时</span><b>${fmtSec(dur)}</b></div>`);
 		kv.push(`<div class="stcm-kv"><span>数据量</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块${rec.tokens > 0 ? ` · ${rec.tokens} token` : ''}</b></div>`);
+		if (rec.finishReason) {
+			kv.push(`<div class="stcm-kv"><span>结束原因</span><b>${escHtml(finishLabel(rec.finishReason))}</b></div>`);
+		}
+		if (rec.promptTokens > 0 || rec.completionTokens > 0) {
+			kv.push(`<div class="stcm-kv"><span>token 用量</span><b>输入 ${rec.promptTokens || 0} · 输出 ${rec.completionTokens || 0}</b></div>`);
+		}
 		const durSec = dur / 1000;
 		if (durSec > 0.15) {
 			const speed = [];
@@ -1317,9 +1445,51 @@ function boot() {
 		}
 	}
 
+	// 上下文占用：取最近一次拿到 token 用量的请求
+	function updateContextBar() {
+		const fill = panel.querySelector('#stcm-ctxfill');
+		const txt = panel.querySelector('#stcm-ctxtxt');
+		if (!fill || !txt) { return; }
+
+		let rec = null;
+		for (const r of activeMap.values()) {
+			if (r.promptTokens > 0) { rec = r; }
+		}
+		if (!rec) {
+			rec = history.find((r) => r.promptTokens > 0) || null;
+		}
+		if (!rec) {
+			fill.style.width = '0';
+			fill.className = 'stcm-ctxfill';
+			txt.textContent = '—';
+			return;
+		}
+
+		// 上限只认用户自己填的：酒馆前端拿不到真实的 openai_max_context
+		// （ctx.maxContext 会给 8192 这类默认值，拿它算百分比会误导）
+		const limit = settings.ctxLimit > 0 ? settings.ctxLimit : 0;
+
+		const used = rec.promptTokens;
+		const fmtK = (n) => n >= 1000000 ? `${(n / 1000000).toFixed(n >= 10000000 ? 0 : 1)}M`
+			: n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k`
+			: String(n);
+		if (limit > 0) {
+			const pct = Math.min(100, (used / limit) * 100);
+			fill.style.width = `${pct.toFixed(1)}%`;
+			fill.className = 'stcm-ctxfill' + (pct >= 90 ? ' stcm-ctx-dead' : pct >= 70 ? ' stcm-ctx-warn' : '');
+			txt.textContent = `${fmtK(used)} / ${fmtK(limit)}（${pct.toFixed(0)}%）`;
+		} else {
+			// 没配上限就不画进度，只报本次用量（避免用错的上限算出误导性的百分比）
+			fill.style.width = '0';
+			fill.className = 'stcm-ctxfill';
+			txt.textContent = `${used.toLocaleString()} token`;
+		}
+	}
+
 	function renderPanel() {
 		if (panel && panel.style.display === 'flex') {
 			renderHistory();
+			updateContextBar();
 		}
 	}
 
