@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.9.1-2026-11-15';
+const VERSION = 'v1.10.0-2026-11-15';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -86,6 +86,71 @@ function boot() {
 
 	// 下游（酒馆）迟迟不消费时，最多先替它缓存这么多字节，超过就暂停读上游
 	const BUFFER_LIMIT = 8 * 1024 * 1024;
+
+	// ---------- 历史持久化：按角色卡存在 localStorage，刷新/切回角色还在 ----------
+	const HIST_PREFIX = 'stcm-hist:';
+	const HIST_MAX = 60;           // 每个角色最多留多少条（localStorage 只有 5MB，要留余量给多角色）
+	const HIST_HEAD_KEEP = 600;    // 每条保留的「返回开头」字符数
+	const HIST_BODY_KEEP = 1500;   // 失败详情原文保留字符数
+
+	function histKeyFor(name) {
+		return HIST_PREFIX + (name || 'default');
+	}
+
+	function currentCharName() {
+		try {
+			return globalThis.SillyTavern?.getContext?.()?.name2 || 'default';
+		} catch { return 'default'; }
+	}
+
+	// 存盘时裁掉大字段，只保留能展示的部分
+	function slimRec(rec) {
+		const dur = rec.end ? Math.round(rec.end - rec.start) : 0;
+		return {
+			id: rec.id,
+			short: rec.short,
+			method: rec.method,
+			startWall: rec.startWall instanceof Date ? rec.startWall.toISOString() : rec.startWall,
+			dur,
+			ttfb: Math.round(rec.ttfb || 0),
+			status: rec.status,
+			state: rec.state,
+			bytes: rec.bytes,
+			chunks: rec.chunks,
+			tokens: rec.tokens,
+			note: rec.note || '',
+			finishReason: rec.finishReason || '',
+			promptTokens: rec.promptTokens || 0,
+			completionTokens: rec.completionTokens || 0,
+			head: String(rec.head || '').slice(0, HIST_HEAD_KEEP),
+			errDetail: rec.errDetail ? {
+				status: rec.errDetail.status,
+				statusText: rec.errDetail.statusText || '',
+				errorCode: rec.errDetail.errorCode || '',
+				message: String(rec.errDetail.message || '').slice(0, 300),
+				body: String(rec.errDetail.body || '').slice(0, HIST_BODY_KEEP),
+			} : null,
+		};
+	}
+
+	// 读回来时把「相对时长」还原成 performance.now 基准的时间点，展示逻辑不用改
+	function reviveRec(o) {
+		const dur = o.dur || 0;
+		const start = performance.now() - dur;
+		const startWall = o.startWall ? new Date(o.startWall) : new Date(Date.now() - dur);
+		return Object.assign({}, o, {
+			startWall,
+			start,
+			end: start + dur,
+			lastData: start,
+			buffered: 0,
+			backpressure: false,
+			scanTail: '',
+			contentChars: 0,
+			argChars: 0,
+			fromStorage: true,
+		});
+	}
 
 	// 酒馆设置的上下文上限（ctx.maxContext 会给到 8192 这类默认值，不准，
 	// 真实值在设置里的 oai_settings.openai_max_context，启动时异步取一次）
@@ -216,6 +281,7 @@ function boot() {
 		}
 		rec.buffered = 0;
 		lastFinished = rec;
+		saveHistorySoon();
 		if (rec.state === 'done') {
 			// 响应里给了精确的输出 token 就直接用；否则才回退到酒馆分词器估算
 			if (rec.completionTokens > 0) {
@@ -716,6 +782,7 @@ function boot() {
 	<label><input type="checkbox" id="stcm-usage"> 请求流式 token 用量（用于上下文条，默认开）</label>
 	<label>上下文上限 <input type="number" min="0" step="1000" id="stcm-ctx-limit" placeholder="0=跟随酒馆"> token</label>
 	<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+		<button id="stcm-clear-hist">清除本角色历史</button>
 		<button id="stcm-reset-pos">重置状态球位置</button>
 		<button id="stcm-selftest-btn">链路自检（页面→酒馆）</button>
 		<span id="stcm-selftest"></span>
@@ -748,6 +815,13 @@ function boot() {
 		bindCheck(panel, '#stcm-pin-top', 'pinNewMessageTop');
 		bindCheck(panel, '#stcm-usage', 'requestUsage');
 		bindNum(panel, '#stcm-ctx-limit', 'ctxLimit', 0);
+		panel.querySelector('#stcm-clear-hist').addEventListener('click', () => {
+			if (!confirm('清除当前角色保存的请求历史？（只删本机记录，不影响聊天）')) { return; }
+			history.length = 0;
+			try { localStorage.removeItem(histKeyFor(currentCharName())); } catch { /* ignore */ }
+			renderHistory();
+			updateContextBar();
+		});
 		panel.querySelector('#stcm-reset-pos').addEventListener('click', resetPillPos);
 		panel.querySelector('#stcm-selftest-btn').addEventListener('click', () => runSelfTest('#stcm-selftest'));
 		panel.querySelector('.stcm-x').addEventListener('click', () => {
@@ -888,6 +962,15 @@ function boot() {
 			}
 		}
 		startTicker();
+
+		// 历史持久化：启动时载入当前角色的记录；切换角色时先存旧的再载新的
+		loadHistoryForCurrentChar();
+		eventSource.on(event_types.CHAT_CHANGED, () => {
+			const nextKey = histKeyFor(currentCharName());
+			if (nextKey === activeHistKey) { return; }   // 同一角色的不同聊天共享历史
+			saveHistoryNow(activeHistKey);
+			loadHistoryForCurrentChar();
+		});
 
 		// 回到前台/窗口重新获得焦点时，立刻刷新一次状态（并校正位置）
 		window.addEventListener('focus', () => { clampPillPos(); clampPanelPos(); tick(); });
@@ -1361,6 +1444,45 @@ function boot() {
 			expandedIds.add(id);
 		}
 		renderHistory();
+	}
+
+	// ---------- 历史持久化的读写 ----------
+	let histSaveTimer = null;
+	let activeHistKey = null;
+
+	function saveHistoryNow(key) {
+		// 必须显式传 key：切换角色时 ctx.name2 已经是新角色，用当前名会存错地方
+		const k = key || activeHistKey || histKeyFor(currentCharName());
+		const write = (list) => {
+			if (!list.length) { localStorage.removeItem(k); return; }
+			localStorage.setItem(k, JSON.stringify(list));
+		};
+		try {
+			write(history.slice(0, HIST_MAX).map(slimRec));
+		} catch {
+			// 配额超限：砍一半再试，还不行就放弃（绝不影响生成流程）
+			try { write(history.slice(0, Math.floor(HIST_MAX / 2)).map(slimRec)); } catch { /* give up */ }
+		}
+	}
+
+	function saveHistorySoon() {
+		clearTimeout(histSaveTimer);
+		histSaveTimer = setTimeout(() => saveHistoryNow(), 700);
+	}
+
+	function loadHistoryForCurrentChar() {
+		history.length = 0;
+		activeHistKey = histKeyFor(currentCharName());
+		try {
+			const raw = localStorage.getItem(activeHistKey);
+			if (raw) {
+				const arr = JSON.parse(raw);
+				if (Array.isArray(arr)) {
+					for (const o of arr.slice(0, HIST_MAX)) { history.push(reviveRec(o)); }
+				}
+			}
+		} catch { /* 数据损坏就当作空历史 */ }
+		renderPanel();
 	}
 
 	// 展开详情的内容指纹：errDetail 异步到位、head 流式增长时版本号变化，才允许重建详情块
