@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.13.1-2026-11-23';
+const VERSION = 'v1.13.2-2026-11-23';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -1433,7 +1433,10 @@ function boot() {
 		}
 		if (rec.state === 'retrying' && rec.retryUntil > now) {
 			const left = (rec.retryUntil - now) / 1000;
-			return { cls: 'stcm-warn', text: `重试 ${rec.attempt}/${rec.retryMax} · 等待 ${left.toFixed(0)}s` };
+			// attemptNo 是「第几次尝试」（第 1 次是原始请求），重试序号要减 1：
+			// 第一次失败后 attemptNo=2 → 显示「重试 1/2」
+			const retryNo = Math.max(1, (rec.attemptNo || 2) - 1);
+			return { cls: 'stcm-warn', text: `重试 ${retryNo}/${rec.retryMax} · 等待 ${left.toFixed(0)}s` };
 		}
 
 		// receiving
