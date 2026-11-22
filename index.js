@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.13.0-2026-11-23';
+const VERSION = 'v1.13.1-2026-11-23';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -227,6 +227,9 @@ function boot() {
 				clearTimeout(timer);
 				if (sig) { sig.removeEventListener('abort', done); }
 				rec.retryUntil = 0;
+				// 关键：复位状态。否则重发后的整个等待/生成期间都停在 replaying 分支，
+				// 因为 retryUntil 已清零，界面会永远显示「重试 n/m · 等待 0s」，看着就像不读秒。
+				rec.state = 'wait';
 				resolve();
 			}
 			if (sig) { sig.addEventListener('abort', done, { once: true }); }
@@ -234,21 +237,78 @@ function boot() {
 	}
 
 	// 带重试的请求：返回最终响应；彻底失败时抛出最后一个错误（交给外层 catch 记录）
-	async function fetchWithRetry(args, rec) {
+	// 读错误体补详情（重试与最终失败共用）
+	async function collectErrDetail(rec, resp) {
+		let raw = '';
+		try { raw = String(await resp.clone().text()); } catch { raw = ''; }
+		let errorCode = '';
+		let message = '';
+		let parsed = null;
+		try { parsed = JSON.parse(raw); } catch { /* 非 JSON，例如 Caddy 的 HTML 502 页 */ }
+		if (parsed) {
+			errorCode = String(parsed.code || (parsed.error && parsed.error.code) || '');
+			message = parsed.message
+				|| (parsed.error && parsed.error.message)
+				|| (typeof parsed.error === 'string' ? parsed.error : '')
+				|| '';
+		}
+		if (!message) {
+			const t = String(raw).trim();
+			if (/^\s*<(!doctype|html|head|body|pre|div)/i.test(t)) {
+				message = t
+					.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+					.replace(/<style[\s\S]*?<\/style>/gi, ' ')
+					.replace(/<[^>]+>/g, ' ')
+					.replace(/\s+/g, ' ')
+					.trim() || `HTTP ${resp.status}`;
+			} else {
+				message = t.length > 300 ? t.slice(0, 300) : t;
+			}
+		}
+		rec.errDetail = {
+			status: resp.status,
+			statusText: resp.statusText || '',
+			errorCode,
+			message: String(message).slice(0, 600),
+			body: String(raw).slice(0, 4000),
+		};
+		if (errorCode) { rec.note = `HTTP ${resp.status} · ${errorCode}`; }
+		return errorCode;
+	}
+
+	// 收尾一条「失败尝试」：独立成条，这样它的详情不会因为后续重试而丢失
+	async function closeFailedAttempt(rec, resp, attemptNo, inherited) {
+		rec.attemptNo = attemptNo;
+		if (resp) {
+			rec.status = resp.status;
+			rec.state = 'error';
+			rec.note = `HTTP ${resp.status}`;
+			await collectErrDetail(rec, resp);
+		} else {
+			rec.state = 'error';
+		}
+		if (inherited && !rec.model) { rec.model = inherited; }
+		finish(rec);
+	}
+
+	// 带重试的请求：返回 { resp, rec }。每次失败尝试各自成条，成功那次单独成条。
+	async function fetchWithRetry(args, firstRec, url, method, baseModel) {
 		const extra = Math.max(0, Number(settings.maxRetries) || 0);
 		const maxAttempts = settings.autoRetry ? 1 + extra : 1;
 		const deadline = performance.now() + Math.max(1000, Number(settings.retryMaxMs) || 300000);
 		const sig = (args[1] && args[1].signal) || null;
-		rec.retryMax = Math.max(1, extra);   // 展示用：最多重试几次
+		const chainId = firstRec.id;
+		let rec = firstRec;
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			rec.attempt = attempt;
-			// 用户已点停止：不再重试，直接按中止处理
+			rec.attemptNo = attempt;
+			rec.retryMax = Math.max(1, extra);
+			rec.retryChain = chainId;
+			if (baseModel && !rec.model) { rec.model = baseModel; }
 			if (sig && sig.aborted) {
 				throw new DOMException('Aborted', 'AbortError');
 			}
 
-			const attemptStart = performance.now();
 			try {
 				const resp = await origFetch(...args);
 				if (!rec.ttfb) { rec.ttfb = performance.now() - rec.start; }
@@ -258,35 +318,34 @@ function boot() {
 					&& isRetryableStatus(resp.status)
 					&& performance.now() < deadline;
 
-				if (!canRetry) { return resp; }
+				if (!canRetry) { return { resp, rec }; }
 
-				// 这一次要重试：先把错误体读掉（释放连接），记一笔，再退避
-				let hint = '';
-				try { hint = String(await resp.text()).slice(0, 100); } catch { /* ignore */ }
-				rec.attempts.push({
-					n: attempt,
-					status: resp.status,
-					dur: Math.round(performance.now() - attemptStart),
-					hint,
-				});
-				appendRetryLog(rec, `第 ${attempt} 次 HTTP ${resp.status}，${Math.round((performance.now() - attemptStart))}ms`);
+				// 这一条失败：独立归档（含完整错误详情），再新开一条继续重试
+				await closeFailedAttempt(rec, resp, attempt, baseModel);
+				rec = beginRecord(url, method);
+				rec.attemptNo = attempt + 1;
+				rec.retryChain = chainId;
+				rec.retryMax = Math.max(1, extra);
+				if (baseModel) { rec.model = baseModel; }
 				await waitBeforeRetry(rec, attempt, sig, deadline);
 				continue;
 			} catch (err) {
 				if (err && err.name === 'AbortError') { throw err; }
 				if (attempt >= maxAttempts || performance.now() >= deadline) { throw err; }
-				rec.attempts.push({
-					n: attempt,
-					error: String((err && err.message) || err).slice(0, 100),
-					dur: Math.round(performance.now() - attemptStart),
-				});
-				appendRetryLog(rec, `第 ${attempt} 次网络错误：${String((err && err.message) || err).slice(0, 60)}`);
+
+				rec.state = 'error';
+				rec.note = `网络错误：${String((err && err.message) || err).slice(0, 80)}`;
+				await closeFailedAttempt(rec, null, attempt, baseModel);
+				rec = beginRecord(url, method);
+				rec.attemptNo = attempt + 1;
+				rec.retryChain = chainId;
+				rec.retryMax = Math.max(1, extra);
+				if (baseModel) { rec.model = baseModel; }
 				await waitBeforeRetry(rec, attempt, sig, deadline);
 				continue;
 			}
 		}
-		// 理论上到不了这里；保底再发一次
-		return origFetch(...args);
+		return { resp: await origFetch(...args), rec };
 	}
 
 	// 把重试动作写进记录的 note，方便事后回看
@@ -456,11 +515,13 @@ function boot() {
 		// （上下文占用条要用）。改不动就原样发，绝不影响请求。
 		const reqModel = maybeRequestUsage(args);
 
-		const rec = beginRecord(url, method);
+		let rec = beginRecord(url, method);
 		if (reqModel) { rec.model = reqModel; }
 
 		try {
-			const resp = await fetchWithRetry(args, rec);
+			const attemptResult = await fetchWithRetry(args, rec, url, method, reqModel);
+			rec = attemptResult.rec;
+			const resp = attemptResult.resp;
 
 			if (!resp.ok) {
 				rec.state = 'error';
@@ -1370,8 +1431,8 @@ function boot() {
 			if (el >= w1) { return { cls: 'stcm-warn', text: `等待响应 ${fmtSec(el)}` }; }
 			return { cls: 'stcm-wait', text: `等待响应 ${fmtSec(el)}` };
 		}
-		if (rec.state === 'retrying') {
-			const left = Math.max(0, (rec.retryUntil - now) / 1000);
+		if (rec.state === 'retrying' && rec.retryUntil > now) {
+			const left = (rec.retryUntil - now) / 1000;
 			return { cls: 'stcm-warn', text: `重试 ${rec.attempt}/${rec.retryMax} · 等待 ${left.toFixed(0)}s` };
 		}
 
@@ -1486,12 +1547,15 @@ function boot() {
 			sub = v.text;
 		} else {
 			const dur = fmtSec(rec.end - rec.start);
-			const retried = (rec.attempts || []).length;
-			const label = rec.state === 'done' ? (retried ? `重试${retried}次后完成` : '完成')
-				: rec.state === 'error' ? `失败 ${rec.note}${retried ? `（重试${retried}次）` : ''}`
+			// 同一次生成的重试会各自成条，用「第 N 次」标出先后，便于对照
+			// 只有确实发生过重试（同一链上有 >1 条）时才标序号，单次请求保持干净
+			const sameChain = rec.retryChain && history.filter((x) => x.retryChain === rec.retryChain).length > 1;
+			const nth = sameChain ? `第${rec.attemptNo || 1}次 · ` : '';
+			const label = rec.state === 'done' ? '完成'
+				: rec.state === 'error' ? `失败 ${rec.note}`
 				: rec.state === 'empty' ? `⚠ ${rec.note || '空响应'}`
 				: '已停止';
-			sub = `${label} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
+			sub = `${nth}${label} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
 		}
 
 		const canExpand = !live && canShowDetail(rec);
