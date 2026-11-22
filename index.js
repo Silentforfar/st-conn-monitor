@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.12.0-2026-11-15';
+const VERSION = 'v1.13.0-2026-11-23';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -52,6 +52,9 @@ function boot() {
 		posX: null,             // 状态球位置（null = 默认右下）
 		posY: null,
 		requestUsage: true,     // 给流式请求补 stream_options.include_usage，换取 token 用量
+		autoRetry: true,        // 失败自动重试（仅网络错误 / 5xx / 429，且此前零字节）
+		maxRetries: 2,          // 最多重试几次（不含首次）
+		retryMaxMs: 300000,     // 重试总时长上限（毫秒），超过就放弃
 		ctxLimit: 0,            // 上下文上限（0 = 跟随酒馆设置）
 		panelX: null,           // 悬浮面板位置（null = 跟随状态球）
 		panelY: null,
@@ -120,6 +123,8 @@ function boot() {
 			tokens: rec.tokens,
 			note: rec.note || '',
 			model: rec.model || '',
+			attempts: (rec.attempts || []).slice(0, 6).map((a) => ({ n: a.n, status: a.status || 0, error: a.error || '', dur: a.dur || 0 })),
+			retryLog: String(rec.retryLog || '').slice(0, 400),
 			finishReason: rec.finishReason || '',
 			promptTokens: rec.promptTokens || 0,
 			completionTokens: rec.completionTokens || 0,
@@ -189,6 +194,104 @@ function boot() {
 			args[1] = Object.assign({}, cfg, { body: JSON.stringify(body) });
 		} catch { /* 非 JSON 或结构异常：原样发送 */ }
 		return model;
+	}
+
+	// ---------- 失败自动重试 ----------
+	// 只对「确定没有产出」的失败重试：网络错误 / 5xx / 429，且此时尚未向下游吐过任何字节。
+	// 这样重放不会让酒馆看到重复内容，也不会误伤「已经流了一半」的响应。
+	const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504, 520, 522, 524]);
+	const isRetryableStatus = (code) => RETRYABLE_STATUS.has(Number(code));
+
+	// 退避：1s → 3s → 6s，带 ±20% 抖动，避免多标签页同时重试撞在一起
+	function retryBackoffMs(attempt) {
+		const base = [1000, 3000, 6000][Math.min(attempt - 1, 2)];
+		return Math.round(base * (0.8 + Math.random() * 0.4));
+	}
+
+	// 等待期间让状态球显示「重试 n/m · 等待 Ns」，用户点停止则立刻中断
+	function waitBeforeRetry(rec, attempt, sig, deadline) {
+		let ms = retryBackoffMs(attempt);
+		const left = deadline - performance.now();
+		if (left <= 0) { return Promise.resolve(); }
+		ms = Math.min(ms, left);
+
+		rec.state = 'retrying';
+		rec.retryUntil = performance.now() + ms;
+		rec.retryMax = Math.max(1, Number(settings.maxRetries) || 1);   // 总重试次数（不含首次）
+		renderPanel();
+		tick();
+
+		return new Promise((resolve) => {
+			const timer = setTimeout(done, ms);
+			function done() {
+				clearTimeout(timer);
+				if (sig) { sig.removeEventListener('abort', done); }
+				rec.retryUntil = 0;
+				resolve();
+			}
+			if (sig) { sig.addEventListener('abort', done, { once: true }); }
+		});
+	}
+
+	// 带重试的请求：返回最终响应；彻底失败时抛出最后一个错误（交给外层 catch 记录）
+	async function fetchWithRetry(args, rec) {
+		const extra = Math.max(0, Number(settings.maxRetries) || 0);
+		const maxAttempts = settings.autoRetry ? 1 + extra : 1;
+		const deadline = performance.now() + Math.max(1000, Number(settings.retryMaxMs) || 300000);
+		const sig = (args[1] && args[1].signal) || null;
+		rec.retryMax = Math.max(1, extra);   // 展示用：最多重试几次
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			rec.attempt = attempt;
+			// 用户已点停止：不再重试，直接按中止处理
+			if (sig && sig.aborted) {
+				throw new DOMException('Aborted', 'AbortError');
+			}
+
+			const attemptStart = performance.now();
+			try {
+				const resp = await origFetch(...args);
+				if (!rec.ttfb) { rec.ttfb = performance.now() - rec.start; }
+				rec.status = resp.status;
+
+				const canRetry = attempt < maxAttempts
+					&& isRetryableStatus(resp.status)
+					&& performance.now() < deadline;
+
+				if (!canRetry) { return resp; }
+
+				// 这一次要重试：先把错误体读掉（释放连接），记一笔，再退避
+				let hint = '';
+				try { hint = String(await resp.text()).slice(0, 100); } catch { /* ignore */ }
+				rec.attempts.push({
+					n: attempt,
+					status: resp.status,
+					dur: Math.round(performance.now() - attemptStart),
+					hint,
+				});
+				appendRetryLog(rec, `第 ${attempt} 次 HTTP ${resp.status}，${Math.round((performance.now() - attemptStart))}ms`);
+				await waitBeforeRetry(rec, attempt, sig, deadline);
+				continue;
+			} catch (err) {
+				if (err && err.name === 'AbortError') { throw err; }
+				if (attempt >= maxAttempts || performance.now() >= deadline) { throw err; }
+				rec.attempts.push({
+					n: attempt,
+					error: String((err && err.message) || err).slice(0, 100),
+					dur: Math.round(performance.now() - attemptStart),
+				});
+				appendRetryLog(rec, `第 ${attempt} 次网络错误：${String((err && err.message) || err).slice(0, 60)}`);
+				await waitBeforeRetry(rec, attempt, sig, deadline);
+				continue;
+			}
+		}
+		// 理论上到不了这里；保底再发一次
+		return origFetch(...args);
+	}
+
+	// 把重试动作写进记录的 note，方便事后回看
+	function appendRetryLog(rec, line) {
+		rec.retryLog = rec.retryLog ? `${rec.retryLog}；${line}` : line;
 	}
 
 	// 把正则抠出来的 JSON 字符串内容还原（处理 \uXXXX、\n 等转义）
@@ -275,6 +378,10 @@ function boot() {
 			tokens: 0,            // 生成结束后用酒馆 tokenizer 数出来的真实 token 数
 			buffered: 0,          // 已从上游读到、但下游还没取走的字节数（内存保护用）
 			backpressure: false,  // 下游是否没在积极消费（true=界面滞后，false=下游在等数据）
+			attempts: [],         // 每次失败尝试的记录 [{n,status|error,dur}]，用于展示重试过程
+			attempt: 1,           // 当前第几次尝试
+			retryUntil: 0,        // 重试等待的结束时刻（performance.now 基准）
+			retryMax: 1,          // 本次允许的最大尝试次数
 			model: '',            // 本次请求的模型名（优先取响应里给的，其次请求体）
 			finishReason: '',     // 上游给的结束原因：stop / length / content_filter / tool_calls
 			promptTokens: 0,      // 本次请求的输入 token（来自响应 usage）
@@ -353,9 +460,7 @@ function boot() {
 		if (reqModel) { rec.model = reqModel; }
 
 		try {
-			const resp = await origFetch(...args);
-			rec.ttfb = performance.now() - rec.start;
-			rec.status = resp.status;
+			const resp = await fetchWithRetry(args, rec);
 
 			if (!resp.ok) {
 				rec.state = 'error';
@@ -821,6 +926,8 @@ function boot() {
 	<label><input type="checkbox" id="stcm-flash"> 卡顿时闪烁标签页标题（后台可见）</label>
 	<label><input type="checkbox" id="stcm-idle"> 空闲时也显示状态球</label>
 	<label><input type="checkbox" id="stcm-pin-top"> 生成结束后停在最新消息开头（不自动置底）</label>
+	<label><input type="checkbox" id="stcm-auto-retry"> 失败自动重试（网络错误 / 5xx / 429，且未收到任何数据）</label>
+	<label>最多重试 <input type="number" min="0" max="5" step="1" id="stcm-max-retry"> 次</label>
 	<label><input type="checkbox" id="stcm-usage"> 请求流式 token 用量（用于上下文条，默认开）</label>
 	<label>上下文上限 <input type="number" min="0" step="1000" id="stcm-ctx-limit" placeholder="0=跟随酒馆"> token</label>
 	<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
@@ -855,6 +962,8 @@ function boot() {
 		bindCheck(panel, '#stcm-flash', 'flashTitle');
 		bindCheck(panel, '#stcm-idle', 'showIdle');
 		bindCheck(panel, '#stcm-pin-top', 'pinNewMessageTop');
+		bindCheck(panel, '#stcm-auto-retry', 'autoRetry');
+		bindNum(panel, '#stcm-max-retry', 'maxRetries', 0);
 		bindCheck(panel, '#stcm-usage', 'requestUsage');
 		bindNum(panel, '#stcm-ctx-limit', 'ctxLimit', 0);
 		panel.querySelector('#stcm-clear-hist').addEventListener('click', () => {
@@ -1119,6 +1228,8 @@ function boot() {
 			set(root, '#stcm-flash, [data-k="flashTitle"]', settings.flashTitle, true);
 			set(root, '#stcm-idle, [data-k="showIdle"]', settings.showIdle, true);
 			set(root, '#stcm-pin-top, [data-k="pinNewMessageTop"]', settings.pinNewMessageTop, true);
+			set(root, '#stcm-auto-retry, [data-k="autoRetry"]', settings.autoRetry, true);
+			set(root, '#stcm-max-retry, [data-k="maxRetries"]', settings.maxRetries);
 			set(root, '#stcm-usage, [data-k="requestUsage"]', settings.requestUsage, true);
 			set(root, '#stcm-ctx-limit, [data-k="ctxLimit"]', settings.ctxLimit);
 		}
@@ -1150,6 +1261,8 @@ function boot() {
 	<label><input type="checkbox" data-k="flashTitle"> 卡顿时闪烁标签页标题（后台可见）</label>
 	<label><input type="checkbox" data-k="showIdle"> 空闲时也显示状态球</label>
 	<label><input type="checkbox" data-k="pinNewMessageTop"> 生成结束后停在最新消息开头（不自动置底）</label>
+	<label><input type="checkbox" data-k="autoRetry"> 失败自动重试（网络错误 / 5xx / 429）</label>
+	<label>最多重试 <input type="number" min="0" max="5" step="1" data-k="maxRetries"> 次</label>
 	<label><input type="checkbox" data-k="requestUsage"> 请求流式 token 用量（上下文条）</label>
 	<label>上下文上限 <input type="number" min="0" step="1000" data-k="ctxLimit" placeholder="0=跟随酒馆"> token</label>
 	<div class="stcmd-btns">
@@ -1181,6 +1294,19 @@ function boot() {
 		});
 		drawer.querySelector('[data-k="showIdle"]').addEventListener('change', (e) => {
 			settings.showIdle = e.target.checked;
+			syncControls();
+			saveSettingsDebounced();
+		});
+		drawer.querySelector('[data-k="autoRetry"]').addEventListener('change', (e) => {
+			settings.autoRetry = e.target.checked;
+			syncControls();
+			saveSettingsDebounced();
+		});
+		drawer.querySelector('[data-k="maxRetries"]').addEventListener('change', (e) => {
+			let v = parseInt(e.target.value, 10);
+			if (!Number.isFinite(v) || v < 0) { v = 0; }
+			if (v > 5) { v = 5; }
+			settings.maxRetries = v;
 			syncControls();
 			saveSettingsDebounced();
 		});
@@ -1244,6 +1370,11 @@ function boot() {
 			if (el >= w1) { return { cls: 'stcm-warn', text: `等待响应 ${fmtSec(el)}` }; }
 			return { cls: 'stcm-wait', text: `等待响应 ${fmtSec(el)}` };
 		}
+		if (rec.state === 'retrying') {
+			const left = Math.max(0, (rec.retryUntil - now) / 1000);
+			return { cls: 'stcm-warn', text: `重试 ${rec.attempt}/${rec.retryMax} · 等待 ${left.toFixed(0)}s` };
+		}
+
 		// receiving
 		const since = now - rec.lastData;
 		if (since >= dead2) {
@@ -1266,7 +1397,11 @@ function boot() {
 	function endedView(rec) {
 		const dur = rec.end - rec.start;
 		switch (rec.state) {
-			case 'done': return { cls: 'stcm-done', text: `✓ 完成 ${fmtSec(dur)} · ${rec.chunks} 块` };
+			case 'done': {
+				const n = (rec.attempts || []).length;
+				const prefix = n > 0 ? `✓ 重试${n}次后成功` : '✓ 完成';
+				return { cls: 'stcm-done', text: `${prefix} ${fmtSec(dur)} · ${rec.chunks} 块` };
+			}
 			case 'error': return { cls: 'stcm-dead', text: `✗ 失败 ${rec.note || ''} · ${fmtSec(dur)}` };
 			case 'aborted': return { cls: 'stcm-abort', text: `■ 已停止 · ${fmtSec(dur)}` };
 			case 'empty': return { cls: 'stcm-warn', text: `⚠ ${rec.note || '空响应'} · ${fmtSec(dur)}` };
@@ -1351,8 +1486,9 @@ function boot() {
 			sub = v.text;
 		} else {
 			const dur = fmtSec(rec.end - rec.start);
-			const label = rec.state === 'done' ? '完成'
-				: rec.state === 'error' ? `失败 ${rec.note}`
+			const retried = (rec.attempts || []).length;
+			const label = rec.state === 'done' ? (retried ? `重试${retried}次后完成` : '完成')
+				: rec.state === 'error' ? `失败 ${rec.note}${retried ? `（重试${retried}次）` : ''}`
 				: rec.state === 'empty' ? `⚠ ${rec.note || '空响应'}`
 				: '已停止';
 			sub = `${label} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
@@ -1410,7 +1546,13 @@ function boot() {
 		if (rec.model) {
 			kv.push(`<div class="stcm-kv"><span>模型</span><b>${escHtml(rec.model)}</b></div>`);
 		}
-		kv.push(`<div class="stcm-kv"><span>耗时</span><b>${fmtSec(dur)} · 首字节 ${fmtSec(rec.ttfb)}</b></div>`);
+		kv.push(`<div class="stcm-kv"><span>耗时</span><b>${fmtSec(dur)}${(rec.attempts || []).length ? '（含重试）' : ''} · 首字节 ${fmtSec(rec.ttfb)}</b></div>`);
+		if ((rec.attempts || []).length) {
+			const steps = rec.attempts
+				.map((a) => (a.status ? `HTTP ${a.status}` : (a.error || '网络错误')).replace(/^HTTP HTTP /, 'HTTP '))
+				.join(' → ');
+			kv.push(`<div class="stcm-kv"><span>尝试</span><b>${escHtml(steps)} → ${rec.state === 'done' ? '成功' : '仍失败'}</b></div>`);
+		}
 		const durSecEarly = dur / 1000;
 		const speedTxt = (rec.tokens > 0 && durSecEarly > 0.15) ? ` · ${fmtRate(rec.tokens / durSecEarly)} token/s` : '';
 		kv.push(`<div class="stcm-kv"><span>数据</span><b>${fmtBytes(rec.bytes)} · ${rec.chunks} 块${speedTxt}</b></div>`);
