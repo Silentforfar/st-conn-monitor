@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.13.2-2026-11-23';
+const VERSION = 'v1.14.0-2026-11-24';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -86,6 +86,8 @@ function boot() {
 
 	// 成功请求也只留开头这么多字符，用于确认「这一帧到底回了什么」
 	const HEAD_LIMIT = 1200;
+	// 生成中允许临时多看一些（结束后会截回 HEAD_LIMIT 再存盘/展示）
+	const LIVE_HEAD_LIMIT = 8000;
 
 	// 下游（酒馆）迟迟不消费时，最多先替它缓存这么多字节，超过就暂停读上游
 	const BUFFER_LIMIT = 8 * 1024 * 1024;
@@ -642,8 +644,8 @@ function boot() {
 									const txt = dec.decode(value, { stream: true });
 									if (txt) {
 										scanChunk(rec, txt);   // 抓 finish_reason / usage / 正文长度
-										// 只留开头一小段：够看出这一帧是不是正常内容，又不占内存
-										if (rec.head.length < HEAD_LIMIT) {
+										// 累积到 8k（生成中可看更多），finish 时会截回 HEAD_LIMIT
+										if (rec.head.length < LIVE_HEAD_LIMIT) {
 											rec.head += txt;
 										}
 									}
@@ -798,7 +800,11 @@ function boot() {
 
 	// 可展开的记录：失败的看错误详情，成功/停止的看耗时与返回开头
 	function canShowDetail(rec) {
-		if (!rec || !rec.end) { return false; }
+		if (!rec) { return false; }
+		if (!rec.end) {
+			// 进行中也能展开看「前面的输出」：只要有已收到的内容，或正在重试等待
+			return !!(rec.head && String(rec.head).trim()) || rec.state === 'retrying';
+		}
 		if (hasErrDetail(rec)) { return true; }
 		return rec.state === 'done' || rec.state === 'aborted' || rec.state === 'empty';
 	}
@@ -1518,6 +1524,7 @@ function boot() {
 		if (panel.style.display === 'flex') {
 			renderHistory();
 			updateContextBar();   // 上限设置改了也要即时反映
+			refreshLiveDetails(); // 生成中的详情持续跟着流更新
 		}
 
 		// 兜底：每 2 秒用「实际渲染位置」校正一次。
@@ -1561,7 +1568,7 @@ function boot() {
 			sub = `${nth}${label} · 用时 ${dur} · TTFB ${fmtSec(rec.ttfb)} · ${fmtBytes(rec.bytes)} · ${rec.chunks} 块`;
 		}
 
-		const canExpand = !live && canShowDetail(rec);
+		const canExpand = canShowDetail(rec);   // 生成中也能展开看已收到的内容
 		const open = canExpand && expandedIds.has(rec.id);
 		const caret = canExpand ? `<span class="stcm-caret">${open ? '▾' : '▸'}</span>` : '';
 
@@ -1631,6 +1638,16 @@ function boot() {
 		}
 
 		const headText = String(rec.head || '').trim();
+
+		// 进行中：只给「截至目前收到的开头」，字段随流变化不展示（结束时会自动换成完整详情）
+		if (!rec.end) {
+			return `
+<div class="stcm-detail" data-live-id="${escHtml(String(rec.id))}">
+	<div class="stcm-headlabel">截至当前已收到（${headText.length} 字，仍在生成）</div>
+	<pre class="stcm-raw">${escHtml(headText)}</pre>
+</div>`;
+		}
+
 		const headBlock = headText
 			? `<div class="stcm-headlabel">返回开头（前 ${Math.min(headText.length, HEAD_LIMIT)} 字）</div><pre class="stcm-raw">${escHtml(headText)}</pre>`
 			: '';
@@ -1733,11 +1750,40 @@ function boot() {
 
 	// 展开详情的内容指纹：errDetail 异步到位、head 流式增长时版本号变化，才允许重建详情块
 	function detailVer(rec) {
+		// 进行中固定为 live：内容增长只更新文本，不重建 DOM
+		if (!rec.end) { return 'live'; }
 		if (hasErrDetail(rec)) {
 			const d = rec.errDetail;
 			return `e:${(d.body || '').length}:${d.message || ''}`;
 		}
 		return `r:${(rec.head || '').length}`;
+	}
+
+	// 生成中的详情：只换文本，不重建节点，保证滚动位置和选区都不被打断
+	function refreshLiveDetails() {
+		if (!panel || panel.style.display !== 'flex') { return; }
+		const nodes = panel.querySelectorAll('.stcm-detail[data-live-id]');
+		if (!nodes.length) { return; }
+		for (const d of nodes) {
+			const rawId = d.getAttribute('data-live-id');
+			// activeMap 的 key 是数字（++uid），DOM 属性是字符串，必须转回来才查得到
+			const rec = activeMap.get(Number(rawId)) || history.find((r) => String(r.id) === rawId);
+			if (!rec || rec.end) { continue; }
+			const txt = String(rec.head || '').trim();
+			const pre = d.querySelector('.stcm-raw');
+			const label = d.querySelector('.stcm-headlabel');
+			if (pre && pre.textContent !== txt) {
+				// 原本贴底就继续跟随最新，否则保持用户当前看到的位置
+				const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+				const keep = pre.scrollTop;
+				pre.textContent = txt;
+				pre.scrollTop = atBottom ? pre.scrollHeight : keep;
+			}
+			if (label) {
+				const next = `截至当前已收到（${txt.length} 字，仍在生成）`;
+				if (label.textContent !== next) { label.textContent = next; }
+			}
+		}
 	}
 
 	function renderHistory() {
