@@ -20,7 +20,7 @@ import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 
 const TAG = '[连接监视]';
-const VERSION = 'v1.14.0-2026-11-24';
+const VERSION = 'v1.15.0-2026-11-27';
 
 // 防重复安装（扩展被重复 import 时直接退出，绝不能包两层）
 if (window.__stConnMonitorInstalled) {
@@ -85,7 +85,7 @@ function boot() {
 	const GEN_URL = (u) => (u.includes('/api/backends/') && u.includes('/generate')) || u.includes('/api/novelai/generate');
 
 	// 成功请求也只留开头这么多字符，用于确认「这一帧到底回了什么」
-	const HEAD_LIMIT = 1200;
+	const HEAD_LIMIT = 2000;
 	// 生成中允许临时多看一些（结束后会截回 HEAD_LIMIT 再存盘/展示）
 	const LIVE_HEAD_LIMIT = 8000;
 
@@ -95,7 +95,7 @@ function boot() {
 	// ---------- 历史持久化：按角色卡存在 localStorage，刷新/切回角色还在 ----------
 	const HIST_PREFIX = 'stcm-hist:';
 	const HIST_MAX = 60;           // 每个角色最多留多少条（localStorage 只有 5MB，要留余量给多角色）
-	const HIST_HEAD_KEEP = 600;    // 每条保留的「返回开头」字符数
+	const HIST_HEAD_KEEP = 2000;   // 每条保留的「返回开头」字符数（与 HEAD_LIMIT 对齐）
 	const HIST_BODY_KEEP = 1500;   // 失败详情原文保留字符数
 
 	function histKeyFor(name) {
@@ -927,7 +927,7 @@ function boot() {
 #stcm-panel .stcm-kv{display:flex;gap:10px;margin:0;padding:1px 0;align-items:baseline;line-height:1.45}
 #stcm-panel .stcm-kv>span{opacity:.55;flex:0 0 auto;min-width:56px;white-space:nowrap}
 #stcm-panel .stcm-kv>b{font-weight:500;word-break:break-word;min-width:0}
-#stcm-panel .stcm-raw{margin:7px 0 0;padding:7px 9px;max-height:148px;overflow:auto;
+#stcm-panel .stcm-raw{margin:7px 0 0;padding:7px 9px;max-height:min(38vh,280px);overflow:auto;overscroll-behavior:contain;
  background:color-mix(in srgb,var(--SmartThemeBodyColor,#000) 16%,transparent);border-radius:6px;
  font-family:var(--monoFontFamily,ui-monospace,Menlo,monospace);font-size:11px;line-height:1.5;
  white-space:pre-wrap;word-break:break-word}
@@ -1703,6 +1703,7 @@ function boot() {
 		if (!canShowDetail(rec)) { return; }
 		if (expandedIds.has(id)) {
 			expandedIds.delete(id);
+			rawScrollById.delete(String(id));
 		} else {
 			expandedIds.add(id);
 		}
@@ -1759,6 +1760,17 @@ function boot() {
 		return `r:${(rec.head || '').length}`;
 	}
 
+	// 行指纹：决定这一行是否真的需要重建。
+	// 已完成记录的副标题（用时/TTFB/字节/块数）是固定的，没必要每 400ms 重解析一次 HTML
+	// —— 20 条 × 2000 字的重建会造成明显卡顿，还会让滚动发涩。
+	function rowVer(rec, open) {
+		if (!rec.end) {
+			// 进行中：读数每帧都在走，强制每 tick 变化
+			return `live:${open ? 1 : 0}:${Math.round(performance.now() / 400)}`;
+		}
+		return `${rec.state}|${rec.chunks}|${rec.bytes}|${rec.tokens || 0}|${rec.attemptNo || 1}|${rec.note || ''}|${open ? 1 : 0}|${(rec.attempts || []).length}`;
+	}
+
 	// 生成中的详情：只换文本，不重建节点，保证滚动位置和选区都不被打断
 	function refreshLiveDetails() {
 		if (!panel || panel.style.display !== 'flex') { return; }
@@ -1786,7 +1798,43 @@ function boot() {
 		}
 	}
 
+	// 每条记录「原始返回」块的滚动位置（按记录 id 记）。
+	// 重排分支会 appendChild 移动整棵节点，浏览器移动 DOM 时内部滚动容器的 scrollTop 会被清零，
+	// 于是每 400ms 一次的重绘会把用户滚到的位置顶回去。这里记住并在渲染后写回。
+	const rawScrollById = new Map();
+
+	function restoreRawScroll() {
+		const box = panel && panel.querySelector('#stcm-history');
+		if (!box) { return; }
+		const apply = () => {
+			for (const pre of box.querySelectorAll('.stcm-item[data-stcm-id] .stcm-raw')) {
+				const item = pre.closest('.stcm-item');
+				const id = item && item.getAttribute('data-stcm-id');
+				if (!id) { continue; }
+				const want = rawScrollById.get(id);
+				// 没有记录就保持浏览器当前值；若硬写 0，会把用户的滚动位置直接顶回去
+				if (want === undefined) { continue; }
+				if (Math.abs(pre.scrollTop - want) > 1) { pre.scrollTop = want; }
+			}
+		};
+		apply();
+		// 节点刚插入时高度可能还没算好，下一帧再兜一次底
+		requestAnimationFrame(apply);
+	}
+
+	// 渲染异常绝不能拖垮 ticker —— 否则状态球、计时、重试全停。只报一次，随后静默跳过。
 	function renderHistory() {
+		try {
+			renderHistoryInner();
+		} catch (e) {
+			if (!renderHistory.__failed) {
+				renderHistory.__failed = true;
+				console.warn('[stcm] 渲染历史出错（已跳过本次）：', e);
+			}
+		}
+	}
+
+	function renderHistoryInner() {
 		const box = panel.querySelector('#stcm-history');
 		if (!box) { return; }
 		if (!box.dataset.stcmBound) {
@@ -1794,11 +1842,28 @@ function boot() {
 			box.addEventListener('pointerdown', () => { suppressToggle = selectionInsidePanel(); });
 			box.addEventListener('pointerup', () => { if (selectionInsidePanel()) { suppressToggle = true; } });
 			box.addEventListener('click', onHistoryClick);
+			// scroll 不冒泡，但能在祖先用 capture 捕获；实时记录每条详情的滚动位置
+			box.addEventListener('scroll', (e) => {
+				const pre = e.target;
+				if (!pre || !pre.classList || !pre.classList.contains('stcm-raw')) { return; }
+				const item = pre.closest('.stcm-item[data-stcm-id]');
+				if (!item) { return; }
+				rawScrollById.set(item.getAttribute('data-stcm-id'), pre.scrollTop);
+			}, true);
 		}
 		// 每 400ms 重绘会打断用户滚动：重绘前后保持滚动位置
 		const scroller = box.closest('.stcm-hist');
 		const keepTop = scroller ? scroller.scrollTop : 0;
 		const atBottom = scroller ? (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4) : false;
+
+		// 采集当前每条详情里「原始返回」的滚动位置。必须在这一帧动 DOM 之前读，
+		// 此时节点还是用户看到的那份，值最真实（scroll 事件的异步性不可依赖）。
+		for (const el of box.querySelectorAll('.stcm-item[data-stcm-id]')) {
+			const pre = el.querySelector('.stcm-raw');
+			if (!pre) { continue; }
+			const id = el.getAttribute('data-stcm-id');
+			if (id) { rawScrollById.set(id, pre.scrollTop); }
+		}
 
 		const rows = [...activeMap.values()].reverse().concat(history).slice(0, 20);
 		if (!rows.length) {
@@ -1829,23 +1894,30 @@ function boot() {
 			for (const { rec, old } of targets) {
 				const wantOpen = expandedIds.has(rec.id) && canShowDetail(rec);
 				const ver = detailVer(rec);
+				const rv = rowVer(rec, wantOpen);
+				const rvChanged = old.getAttribute('data-stcm-rv') !== rv;
 				const keepDetail = wantOpen && old.querySelector('.stcm-detail') && old.getAttribute('data-stcm-dv') === ver;
-				tmp.innerHTML = historyRow(rec);
-				const newRow = tmp.firstElementChild.querySelector('.stcm-row');
-				const newDetail = tmp.firstElementChild.querySelector('.stcm-detail');
-				const curRow = old.querySelector('.stcm-row');
-				// 头部变了才替换（避免每 400ms 重建导致 hover 闪烁）
-				if (curRow && newRow && curRow.innerHTML !== newRow.innerHTML) {
-					curRow.replaceWith(newRow);
-				}
-				if (wantOpen && !keepDetail) {
-					// 详情刚展开或内容版本变化：原位替换 detail（位置不变，只丢这一次滚动）
-					const curDetail = old.querySelector('.stcm-detail');
-					if (newDetail) {
+				const needDetail = wantOpen && !keepDetail;
+
+				// 只在「副标题/展开态变了」或「详情内容版本变了」时才重建这一行
+				if (rvChanged || needDetail) {
+					tmp.innerHTML = historyRow(rec);
+					const newRow = tmp.firstElementChild.querySelector('.stcm-row');
+					const newDetail = tmp.firstElementChild.querySelector('.stcm-detail');
+					const curRow = old.querySelector('.stcm-row');
+					// 头部确实不同才替换（避免无谓重建导致 hover 闪烁）
+					if (curRow && newRow && curRow.innerHTML !== newRow.innerHTML) {
+						curRow.replaceWith(newRow);
+					}
+					if (needDetail && newDetail) {
+						// 详情刚展开或内容版本变化：原位替换 detail（位置不变）
+						const curDetail = old.querySelector('.stcm-detail');
 						if (curDetail) { curDetail.replaceWith(newDetail); } else { old.appendChild(newDetail); }
 						old.setAttribute('data-stcm-dv', ver);
 					}
-				} else if (!wantOpen && old.getAttribute('data-stcm-dv')) {
+					old.setAttribute('data-stcm-rv', rv);
+				}
+				if (!wantOpen && old.getAttribute('data-stcm-dv')) {
 					const curDetail = old.querySelector('.stcm-detail');
 					if (curDetail) { curDetail.remove(); }
 					old.removeAttribute('data-stcm-dv');
@@ -1856,13 +1928,16 @@ function boot() {
 			const frag = document.createDocumentFragment();
 			for (const { rec, old } of targets) {
 				const wantOpen = expandedIds.has(rec.id) && canShowDetail(rec);
-				if (old && wantOpen && old.querySelector('.stcm-detail') && old.getAttribute('data-stcm-dv') === detailVer(rec)) {
-					// 保留旧节点（移动会丢滚动，但此分支只在重排帧发生）
+				const ver = detailVer(rec);
+				if (old && wantOpen && old.querySelector('.stcm-detail') && old.getAttribute('data-stcm-dv') === ver) {
+					// 保留旧节点（移动会丢滚动，由 restoreRawScroll 写回）
+					old.setAttribute('data-stcm-rv', rowVer(rec, wantOpen));
 					frag.appendChild(old);
 				} else {
 					tmp.innerHTML = historyRow(rec);
 					const nu = tmp.firstElementChild;
-					if (wantOpen) { nu.setAttribute('data-stcm-dv', detailVer(rec)); }
+					if (wantOpen) { nu.setAttribute('data-stcm-dv', ver); }
+					nu.setAttribute('data-stcm-rv', rowVer(rec, wantOpen));
 					frag.appendChild(nu);
 				}
 			}
@@ -1873,6 +1948,8 @@ function boot() {
 			// 用户本来贴着底部看最新记录 -> 重绘后继续贴底；否则恢复原滚动位置
 			scroller.scrollTop = atBottom ? scroller.scrollHeight : keepTop;
 		}
+		// 详情内部的滚动与外部互不影响，单独恢复
+		restoreRawScroll();
 	}
 
 	// 上下文占用：取最近一次拿到 token 用量的请求
